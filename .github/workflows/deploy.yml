@@ -1,0 +1,120 @@
+name: Build and deploy
+
+# Every push to main builds an image, pushes it to ECR, and rolls it out to the
+# demo host via SSM. Images are tagged with the commit SHA, so rolling back is
+# re-running deploy.sh on the host with an earlier SHA.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prompt-tracing
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE: arn:aws:iam::975050374027:role/GitHubActionsEKSRole
+  REGISTRY: 975050374027.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: prompt-tracing
+  INSTANCE_ID: i-01aa658f5f67337bd
+
+permissions:
+  id-token: write   # required to mint the OIDC token for AWS
+  contents: read
+
+jobs:
+  deploy:
+    name: Build, push and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the commit being deployed
+        uses: actions/checkout@v4
+
+      - name: Assume the AWS deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Roll out to the host over SSM
+        id: rollout
+        run: |
+          set -euo pipefail
+
+          echo "Dispatching deploy of ${GITHUB_SHA} to ${INSTANCE_ID}"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy prompt-tracing ${GITHUB_SHA:0:7}" \
+            --timeout-seconds 600 \
+            --parameters "$(jq -nc --arg c "/opt/prompt-tracing/deploy.sh ${GITHUB_SHA}" \
+                '{commands: [$c], executionTimeout: ["600"]}')" \
+            --query 'Command.CommandId' --output text)
+
+          echo "SSM command: $COMMAND_ID"
+
+          # Poll until the host reports a terminal state.
+          for _ in $(seq 1 60); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+          done
+
+          echo "--- host output ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text
+
+          ERR=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" --query 'StandardErrorContent' --output text)
+          if [ -n "$ERR" ] && [ "$ERR" != "None" ]; then
+            echo "--- host stderr ---"
+            echo "$ERR"
+          fi
+
+          # A red build must mean a failed deploy, not just a failed dispatch.
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deploy failed on the host with status: $STATUS"
+            exit 1
+          fi
+          echo "Deployed ${GITHUB_SHA} successfully"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### prompt-tracing deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| Image tag | \`${GITHUB_SHA}\` |"
+            echo "| Result | ${{ steps.rollout.outcome }} |"
+            echo "| URL | https://prompt-tracing.voicing.ai |"
+            echo ""
+            echo "Roll back on the host with:"
+            echo '```'
+            echo "/opt/prompt-tracing/deploy.sh <previous-commit-sha>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
