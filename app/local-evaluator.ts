@@ -196,7 +196,7 @@ function ensureMetricCatalog(store: Store) {
 
 function read(): Store {
   if (typeof window === "undefined") return fresh();
-  try { const value = window.localStorage.getItem(key); if (value) { const saved = JSON.parse(value) as Store; let changed = false; if (saved.flowVersion !== flowVersion) { saved.datasets = saved.datasets.map(rebuildSuggestions); saved.flowVersion = flowVersion; changed = true; } if (saved.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(saved); changed = true; } if (changed) write(saved); return saved; } } catch { /* reset malformed local state */ }
+  try { const value = window.localStorage.getItem(key); if (value) { const saved = JSON.parse(value) as Store; let changed = false; if (!saved.prompts) { saved.prompts = []; changed = true; } if (saved.flowVersion !== flowVersion) { saved.datasets = saved.datasets.map(rebuildSuggestions); saved.flowVersion = flowVersion; changed = true; } if (saved.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(saved); changed = true; } if (changed) write(saved); return saved; } } catch { /* reset malformed local state */ }
   const initial = fresh(); write(initial); return initial;
 }
 function write(store: Store) { if (typeof window !== "undefined") window.localStorage.setItem(key, JSON.stringify(store)); }
@@ -262,7 +262,7 @@ export function idealReplyTemplate(action: string) {
     intent: "your request",
   });
 }
-function buildDataset(payload: Doc) {
+function buildHeuristicDataset(payload: Doc) {
   const combinedCsv = payload.turn_data_csv ?? payload.actual_agent_turn_csv;
   const userCsv = payload.user_turn_csv ?? combinedCsv;
   const actualCsv = payload.actual_turn_csv ?? combinedCsv;
@@ -321,11 +321,76 @@ function buildDataset(payload: Doc) {
   return { name: payload.name, source: "Actual Agent Turn Data CSV", conversations, conversationCount: conversations.length, actualConversationCount: conversations.filter((item) => item.actualAttached).length };
 }
 
+function selectedPrompts(store: Store, payload: Doc) {
+  const all = store.prompts ?? [];
+  const select = (source: "global" | "node", id?: string | null) => id
+    ? all.find((prompt) => prompt.id === id && prompt.source === source)
+    : all.find((prompt) => prompt.source === source && prompt.active);
+  const global = select("global", payload.global_prompt_id);
+  const node = select("node", payload.node_prompt_id);
+  if (!global?.text?.trim()) throw new Error("Add and select a global prompt before generating ideal behavior.");
+  return { global, node: node?.text?.trim() ? node : null };
+}
+
+function promptSourceLabel(prompt: Doc) {
+  return `${prompt.source === "global" ? "Global prompt" : `${prompt.node_name || "Node"} prompt`} · ${prompt.name} v${prompt.version}`;
+}
+
+async function promptGeneratedRows(userRows: Doc[], prompts: { global: Doc; node: Doc | null }) {
+  const response = await fetch("/api/ideal", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      globalPrompt: { name: prompts.global.name, version: prompts.global.version, text: prompts.global.text },
+      nodePrompt: prompts.node ? { name: prompts.node.name, nodeName: prompts.node.node_name, version: prompts.node.version, text: prompts.node.text } : null,
+      turns: userRows.map((row) => ({ turn: row.turn, userTurn: row.content })),
+    }),
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.detail ?? "Ideal scenario generation failed.");
+  if (!Array.isArray(body.idealRows)) throw new Error("Ideal scenario generator returned an unreadable result.");
+  return userRows.map((row, index) => {
+    const ideal = body.idealRows[index];
+    if (!ideal || Number(ideal.turn) !== Number(row.turn) || !actions.includes(ideal.idealAction) || typeof ideal.idealResponse !== "string" || !ideal.idealResponse.trim()) throw new Error(`The ideal scenario generator did not return a valid row for turn ${row.turn}.`);
+    return { id: uid(), turn: row.turn, userTurn: row.content, suggestedAction: ideal.idealAction, idealAction: ideal.idealAction, idealResponse: ideal.idealResponse, idealOverride: false, generatedFromPrompts: true };
+  });
+}
+
+async function applyPromptGeneratedIdeals(dataset: Doc, prompts: { global: Doc; node: Doc | null }, preserveManualOverrides = false): Promise<Doc> {
+  const conversations = await Promise.all(dataset.conversations.map(async (conversation: Doc) => {
+    const generatedRows = await promptGeneratedRows(conversation.userRows, prompts);
+    const priorRows = new Map<string, Doc>((conversation.idealRows ?? []).map((row: Doc) => [String(row.turn), row]));
+    return {
+      ...conversation,
+      idealRows: generatedRows.map((row) => {
+        const prior = priorRows.get(String(row.turn));
+        return preserveManualOverrides && prior?.idealOverride ? { ...row, id: prior.id, idealAction: prior.idealAction, idealResponse: prior.idealResponse, idealOverride: true } : row;
+      }),
+    };
+  }));
+  return {
+    ...dataset,
+    conversations,
+    idealGeneration: {
+      sources: [promptSourceLabel(prompts.global), ...(prompts.node ? [promptSourceLabel(prompts.node)] : [])],
+      globalPromptId: prompts.global.id,
+      nodePromptId: prompts.node?.id ?? null,
+      generatedAt: now(),
+      model: "gpt-4.1-mini",
+    },
+    updated_at: now(),
+  };
+}
+
+async function buildDataset(store: Store, payload: Doc) {
+  return applyPromptGeneratedIdeals(buildHeuristicDataset(payload), selectedPrompts(store, payload));
+}
+
 function csvCell(value: unknown) { const text = String(value ?? ""); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 function rebuildSuggestions(dataset: Doc): Doc {
   const userRows = ["conversation_id,turn,user_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.userRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
   const actualRows = ["conversation_id,turn,actual_agent_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.actualRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
-  const rebuilt = buildDataset({ name: dataset.name, user_turn_csv: userRows, actual_turn_csv: dataset.conversations.some((conversation: Doc) => conversation.actualRows.length) ? actualRows : null });
+  const rebuilt = buildHeuristicDataset({ name: dataset.name, user_turn_csv: userRows, actual_turn_csv: dataset.conversations.some((conversation: Doc) => conversation.actualRows.length) ? actualRows : null });
   const priorRows = new Map<string, Doc>(dataset.conversations.flatMap((conversation: Doc) => conversation.idealRows.map((row: Doc) => [`${conversation.conversationId}:${row.turn}`, row] as [string, Doc])));
   rebuilt.conversations.forEach((conversation: Doc) => conversation.idealRows.forEach((row: Doc) => {
     const prior = priorRows.get(`${conversation.conversationId}:${row.turn}`);
@@ -416,6 +481,15 @@ function metricBlocks(metrics: Doc[]) {
   })));
 }
 
+function promptBlocks(prompts: Doc[]) {
+  return prompts.flatMap((prompt) => (prompt.blocks ?? blocks(prompt.source, prompt.text ?? "")).map((block: Doc) => ({
+    ...block,
+    promptName: prompt.name,
+    promptVersion: prompt.version,
+    sourceLabel: promptSourceLabel(prompt),
+  })));
+}
+
 function blockForAction(action: string, blocks: Doc[]) {
   const keywords = actionKeywords[action] ?? [];
   return blocks.map((block) => ({ block, relevance: keywords.reduce((total, keyword) => total + (block.text.toLowerCase().includes(keyword.toLowerCase()) ? 1 : 0), 0) }))
@@ -462,16 +536,28 @@ function traceFor(expectedAction: string, actualAction: string, actualResponse: 
   };
 }
 
+function promptsForAnalysis(store: Store, payload: Doc, dataset: Doc) {
+  const all = store.prompts ?? [];
+  const select = (source: "global" | "node", id?: string | null) => id
+    ? all.filter((prompt) => prompt.id === id && prompt.source === source)
+    : all.filter((prompt) => prompt.source === source && prompt.active);
+  const globalId = payload.global_prompt_id ?? dataset.idealGeneration?.globalPromptId;
+  const nodeId = payload.node_prompt_id ?? dataset.idealGeneration?.nodePromptId;
+  return [...select("global", globalId), ...select("node", nodeId)];
+}
+
 async function analyze(store: Store, datasetId: string, payload: Doc) {
   const dataset = store.datasets.find((item) => item.id === datasetId); if (!dataset) throw new Error("Dataset not found."); const conversations = dataset.conversations.filter((item: Doc) => item.actualTurns?.length); if (!conversations.length) throw new Error("This dataset has no matching actual-agent turns.");
-  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id)); const evidenceBlocks = metricBlocks(metrics); const runs = await Promise.all(conversations.map(async (conversation: Doc) => { const ideal = idealTurns(conversation); let callerIndex = -1; const actions = conversation.actualTurns.filter((turn: Turn) => turn.role === "agent").map((turn: Turn) => { callerIndex += 1; const row = conversation.idealRows[callerIndex] ?? {}; const expectedAction = selectedAction(row); const actualAction = actionFor(turn.content); return { turn: turn.index + 1, callerInput: row.userTurn ?? "", agentResponse: turn.content, expectedAction, actualAction, decision: actualAction === expectedAction || actualAction === "ACKNOWLEDGE" ? "CORRECT" : "INCORRECT", promptTrace: traceFor(expectedAction, actualAction, turn.content, evidenceBlocks) }; }); const results = await Promise.all(metrics.map(async (metric) => { if (metric.implementation_key) { const [value, reason, break_turn] = score(metric.implementation_key, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: value, status: value >= metric.threshold ? "PASS" : "FAIL", reason, break_turn }; } try { const judged = await llmMetric(metric, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: judged.score, status: judged.score >= metric.threshold ? "PASS" : "FAIL", reason: judged.reason }; } catch (error) { return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run." }; } })); const scored = results.filter((result) => result.score != null); const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null; const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: weightedScore == null ? "NOT_RUN" : weightedScore >= .8 ? "PASS" : "FAIL", weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, idealTranscript: ideal, actionTrace: actions, breaks: actions.filter((item: Doc) => item.decision === "INCORRECT").map((item: Doc) => ({ turn: item.turn, expectedAction: item.expectedAction, actualAction: item.actualAction, severity: "HIGH", suggestedFix: `The selected ideal next action is ${String(item.expectedAction).replaceAll("_", " ").toLowerCase()}.` })), sources: { criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1); store.runs.unshift(report); return report; })); return { datasetId, runs };
+  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id)); const prompts = promptsForAnalysis(store, payload, dataset); const evidenceBlocks = [...promptBlocks(prompts), ...metricBlocks(metrics)]; const runs = await Promise.all(conversations.map(async (conversation: Doc) => { const ideal = idealTurns(conversation); let callerIndex = -1; const actions = conversation.actualTurns.filter((turn: Turn) => turn.role === "agent").map((turn: Turn) => { callerIndex += 1; const row = conversation.idealRows[callerIndex] ?? {}; const expectedAction = selectedAction(row); const actualAction = actionFor(turn.content); return { turn: turn.index + 1, callerInput: row.userTurn ?? "", agentResponse: turn.content, expectedAction, actualAction, decision: actualAction === expectedAction || actualAction === "ACKNOWLEDGE" ? "CORRECT" : "INCORRECT", promptTrace: traceFor(expectedAction, actualAction, turn.content, evidenceBlocks) }; }); const results = await Promise.all(metrics.map(async (metric) => { if (metric.implementation_key) { const [value, reason, break_turn] = score(metric.implementation_key, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: value, status: value >= metric.threshold ? "PASS" : "FAIL", reason, break_turn }; } try { const judged = await llmMetric(metric, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: judged.score, status: judged.score >= metric.threshold ? "PASS" : "FAIL", reason: judged.reason }; } catch (error) { return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run." }; } })); const scored = results.filter((result) => result.score != null); const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null; const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: weightedScore == null ? "NOT_RUN" : weightedScore >= .8 ? "PASS" : "FAIL", weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, idealTranscript: ideal, actionTrace: actions, breaks: actions.filter((item: Doc) => item.decision === "INCORRECT").map((item: Doc) => ({ turn: item.turn, expectedAction: item.expectedAction, actualAction: item.actualAction, severity: "HIGH", suggestedFix: `The selected ideal next action is ${String(item.expectedAction).replaceAll("_", " ").toLowerCase()}.` })), sources: { policy: prompts.map(promptSourceLabel), criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1); store.runs.unshift(report); return report; })); return { datasetId, runs };
 }
 
 export async function localRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const store = read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc;
-  if (url === "/api/metrics" && options.method === "POST") { result = make("metric", payload, store.metrics.length + 1); store.metrics.unshift(result); }
+  if (url === "/api/prompts" && options.method === "POST") { if (!payload.name?.trim() || !payload.text?.trim() || !["global", "node"].includes(payload.source)) throw new Error("Prompt name, source, and text are required."); if (payload.source === "node" && !payload.node_name?.trim()) throw new Error("A node prompt needs a node name."); store.prompts ??= []; if (payload.set_active) store.prompts.forEach((item) => { if (item.source === payload.source) item.active = false; }); const version = Math.max(0, ...store.prompts.filter((item) => item.source === payload.source).map((item) => item.version ?? 0)) + 1; result = make("prompt", { ...payload, blocks: blocks(payload.source, payload.text) }, version, Boolean(payload.set_active)); store.prompts.unshift(result); }
+  else if (url === "/api/metrics" && options.method === "POST") { result = make("metric", payload, store.metrics.length + 1); store.metrics.unshift(result); }
   else if (/^\/api\/metrics\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.metrics.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Metric not found."); const old = store.metrics[index]; result = make("metric", { ...payload, isDefault: old.isDefault ?? false, definition_id: old.definition_id ?? old.id }, old.version + 1); store.metrics[index] = result; }
-  else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", buildDataset(payload), store.datasets.length + 1); store.datasets.unshift(result); }
+  else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", await buildDataset(store, payload), store.datasets.length + 1); store.datasets.unshift(result); }
+  else if (/^\/api\/datasets\/[^/]+\/generate-ideals$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = await applyPromptGeneratedIdeals(store.datasets[index], selectedPrompts(store, payload), payload.preserve_manual_overrides !== false); store.datasets[index] = result; }
   else if (/^\/api\/datasets\/[^/]+\/ideal-table$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = applyIdealTableCsv(store.datasets[index], payload.ideal_behavior_csv ?? ""); store.datasets[index] = result; }
   else if (/^\/api\/datasets\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.datasets.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Dataset not found."); result = { ...store.datasets[index], ...payload, updated_at: now() }; store.datasets[index] = result; }
   else { const match = url.match(/^\/api\/datasets\/([^/]+)\/analyze$/); if (!match || options.method !== "POST") throw new Error("This action is not available locally."); result = await analyze(store, match[1], payload); }
