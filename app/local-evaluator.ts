@@ -262,56 +262,16 @@ export function idealReplyTemplate(action: string) {
     intent: "your request",
   });
 }
-function buildHeuristicDataset(payload: Doc) {
+function buildDatasetShell(payload: Doc) {
   const combinedCsv = payload.turn_data_csv ?? payload.actual_agent_turn_csv;
   const userCsv = payload.user_turn_csv ?? combinedCsv;
   const actualCsv = payload.actual_turn_csv ?? combinedCsv;
   if (!userCsv) throw new Error("Upload Actual Agent Turn Data with conversation_id, turn, user_turn, and agent_turn columns.");
   const users = csvGroups(userCsv, "user"); const actuals = actualCsv ? csvGroups(actualCsv, "actual") : new Map<string, Doc[]>();
   const conversations = [...users.entries()].map(([conversationId, userRows]) => {
-    const state: Doc = { shareholderStatus: "unknown", shareholderRefusals: 0, relationship: null, company: null, companyMentions: 0, companyAttempts: 0, companySearchFailures: 0, companyConfirmed: false, companyTrouble: false, companyBypassed: false, multipleCompanies: false, intent: null, multipleIntents: false, summary: false, finalConfirmation: false, openingDelivered: false, hasUsableCallerData: false };
-    let previousIdealAction = "";
-    const idealRows = userRows.map((row) => {
-      let status = shareholderStatus(row.content);
-      const suppliedRelationship = relationship(row.content);
-      const suppliedCompanies = companiesForTurn(row.content, previousIdealAction);
-      const suppliedIntents = intents(row.content);
-
-      if (status || suppliedRelationship || suppliedCompanies.length || suppliedIntents.length) state.hasUsableCallerData = true;
-
-      if (!status && (previousIdealAction === "ASK_SHAREHOLDER_STATUS" || state.shareholderStatus === "unknown") && affirmative(row.content)) status = "yes";
-      if (!status && (previousIdealAction === "ASK_SHAREHOLDER_STATUS" || state.shareholderStatus === "unknown") && negative(row.content)) status = "no";
-      if (status) { state.shareholderStatus = status; state.shareholderRefusals = 0; }
-      if (suppliedRelationship) { state.shareholderStatus = "no"; state.relationship = suppliedRelationship; }
-      if (state.shareholderStatus === "unknown" && shareholderRefusal(row.content)) state.shareholderRefusals += 1;
-      if (affirmative(row.content) && previousIdealAction === "CALL_COMPANY_RESOLVER") state.companyConfirmed = true;
-      if (negative(row.content) && previousIdealAction === "CALL_COMPANY_RESOLVER" && !suppliedCompanies.length) { state.company = null; state.companyConfirmed = false; }
-      if (affirmative(row.content) && ["GIVE_FINAL_SUMMARY", "ASK_FINAL_CONFIRMATION"].includes(previousIdealAction)) state.finalConfirmation = true;
-      if (["ASK_FOR_COMPANY", "ASK_COMPANY_FOCUS", "CALL_COMPANY_RESOLVER"].includes(previousIdealAction) && !suppliedCompanies.length && companySearchFailure(row.content)) {
-        state.companySearchFailures += 1;
-        if (state.companySearchFailures >= 3) state.companyTrouble = true;
-      }
-
-      if (suppliedCompanies.length > 1) { state.multipleCompanies = true; state.companyConfirmed = false; }
-      if (suppliedCompanies.length === 1) {
-        state.multipleCompanies = false;
-        state.company = suppliedCompanies[0];
-        state.companyConfirmed = false;
-        state.companyMentions += 1;
-        if (state.companyAttempts >= 2 || state.companyMentions >= 3) state.companyTrouble = true;
-      }
-      if (suppliedIntents.length > 1) { state.multipleIntents = true; state.intent = null; }
-      if (suppliedIntents.length === 1) { state.multipleIntents = false; state.intent = suppliedIntents[0]; }
-
-      const suggestedAction = nextAction(state);
-      const idealResponse = responseFor(suggestedAction, state);
-      if (suggestedAction === "GIVE_FULL_INTRODUCTION") state.openingDelivered = true;
-      if (suggestedAction === "CALL_COMPANY_RESOLVER") state.companyAttempts += 1;
-      if (suggestedAction === "HANDLE_COMPANY_LOOKUP_FAILURE") { state.companyTrouble = true; state.companyBypassed = true; }
-      if (suggestedAction === "GIVE_FINAL_SUMMARY") state.summary = true;
-      previousIdealAction = suggestedAction;
-      return { id: uid(), turn: row.turn, userTurn: row.content, suggestedAction, idealAction: suggestedAction, idealResponse, idealOverride: false };
-    });
+    // This only builds the uploaded conversation structure. Ideal rows are
+    // populated exclusively by the active prompt versions in /api/ideal.
+    const idealRows = userRows.map((row) => ({ id: uid(), turn: row.turn, userTurn: row.content, suggestedAction: "", idealAction: "", idealResponse: "", idealOverride: false }));
     const actualRows = actuals.get(conversationId) ?? [];
     const matching = new Map(actualRows.map((row) => [row.turn, row]));
     const actualTurns: Turn[] = [];
@@ -321,14 +281,11 @@ function buildHeuristicDataset(payload: Doc) {
   return { name: payload.name, source: "Actual Agent Turn Data CSV", conversations, conversationCount: conversations.length, actualConversationCount: conversations.filter((item) => item.actualAttached).length };
 }
 
-function selectedPrompts(store: Store, payload: Doc) {
+function selectedPrompts(store: Store) {
   const all = store.prompts ?? [];
-  const select = (source: "global" | "node", id?: string | null) => id
-    ? all.find((prompt) => prompt.id === id && prompt.source === source)
-    : all.find((prompt) => prompt.source === source && prompt.active);
-  const global = select("global", payload.global_prompt_id);
-  const node = select("node", payload.node_prompt_id);
-  if (!global?.text?.trim()) throw new Error("Add and select a global prompt before generating ideal behavior.");
+  const global = all.find((prompt) => prompt.source === "global" && prompt.active);
+  const node = all.find((prompt) => prompt.source === "node" && prompt.active);
+  if (!global?.text?.trim()) throw new Error("Set an active global prompt before generating ideal behavior.");
   return { global, node: node?.text?.trim() ? node : null };
 }
 
@@ -383,27 +340,38 @@ async function applyPromptGeneratedIdeals(dataset: Doc, prompts: { global: Doc; 
 }
 
 async function buildDataset(store: Store, payload: Doc) {
-  return applyPromptGeneratedIdeals(buildHeuristicDataset(payload), selectedPrompts(store, payload));
+  const dataset = buildDatasetShell(payload);
+  return applyPromptGeneratedIdeals(dataset, selectedPrompts(store));
 }
 
 function csvCell(value: unknown) { const text = String(value ?? ""); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
 function rebuildSuggestions(dataset: Doc): Doc {
   const userRows = ["conversation_id,turn,user_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.userRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
   const actualRows = ["conversation_id,turn,actual_agent_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.actualRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
-  const rebuilt = buildHeuristicDataset({ name: dataset.name, user_turn_csv: userRows, actual_turn_csv: dataset.conversations.some((conversation: Doc) => conversation.actualRows.length) ? actualRows : null });
+  const rebuilt = buildDatasetShell({ name: dataset.name, user_turn_csv: userRows, actual_turn_csv: dataset.conversations.some((conversation: Doc) => conversation.actualRows.length) ? actualRows : null });
   const priorRows = new Map<string, Doc>(dataset.conversations.flatMap((conversation: Doc) => conversation.idealRows.map((row: Doc) => [`${conversation.conversationId}:${row.turn}`, row] as [string, Doc])));
   rebuilt.conversations.forEach((conversation: Doc) => conversation.idealRows.forEach((row: Doc) => {
     const prior = priorRows.get(`${conversation.conversationId}:${row.turn}`);
-    // Keep a deliberate user edit, but replace stale automatically generated
-    // choices with the corrected next-step recommendation.
-    const hasManualOverride = prior?.idealOverride === true || (prior?.idealAction && prior.idealAction !== prior.suggestedAction);
-    if (hasManualOverride) {
-      row.idealAction = prior.idealAction;
-      row.idealResponse = prior.idealResponse;
-      row.idealOverride = true;
-    }
+    // Dataset reconstruction must never replace prompt-generated ideals with
+    // local flow suggestions. Keep every previously generated or edited row.
+    if (prior) Object.assign(row, {
+      id: prior.id,
+      suggestedAction: prior.suggestedAction,
+      idealAction: prior.idealAction,
+      idealResponse: prior.idealResponse,
+      idealOverride: prior.idealOverride,
+      generatedFromPrompts: prior.generatedFromPrompts,
+    });
   }));
   return { ...dataset, ...rebuilt, updated_at: now() };
+}
+
+function idealRowKey(conversationId: unknown, turn: unknown) {
+  const id = String(conversationId ?? "").trim();
+  const rawTurn = String(turn ?? "").trim();
+  const asNumber = Number(rawTurn);
+  const normalizedTurn = rawTurn && Number.isFinite(asNumber) ? String(asNumber) : rawTurn;
+  return `${id}:${normalizedTurn}`;
 }
 
 function applyIdealTableCsv(dataset: Doc, csv: string): Doc {
@@ -415,26 +383,60 @@ function applyIdealTableCsv(dataset: Doc, csv: string): Doc {
   const turn = at(["turn", "turnnumber", "turnid", "sequence", "index", "order"]);
   const action = at(["idealaction", "idealnextaction", "action"]);
   const reply = at(["idealagentturn", "idealresponse", "idealbehavior", "idealbehaviour", "idealreply"]);
-  if (conversation < 0 || turn < 0 || (action < 0 && reply < 0)) throw new Error("Ideal behavior CSV requires conversation_id, turn, and ideal_action and/or ideal_agent_turn columns.");
-  const updates = new Map<string, { action?: string; reply?: string }>();
-  values.slice(1).forEach((value) => {
-    const id = value[conversation]; const number = value[turn];
-    if (!id || !number) return;
-    const nextAction = action >= 0 ? value[action]?.trim() : "";
-    const nextReply = reply >= 0 ? value[reply] : "";
-    if (nextAction || nextReply) updates.set(`${id}:${number}`, { action: nextAction || undefined, reply: nextReply || undefined });
+  if (conversation < 0 || turn < 0 || action < 0 || reply < 0) throw new Error("The ideal behavior file requires Conversation ID, Turn, Ideal_Action, and Ideal_Agent_Turn columns.");
+
+  const updates = new Map<string, { action: string; reply: string }>();
+  values.slice(1).forEach((value, index) => {
+    const id = value[conversation]?.trim();
+    const number = value[turn]?.trim();
+    const nextAction = value[action]?.trim();
+    const nextReply = value[reply]?.trim();
+    if (!id && !number && !nextAction && !nextReply) return;
+    if (!id || !number || !nextAction || !nextReply) throw new Error(`Ideal behavior row ${index + 2} must include Conversation ID, Turn, Ideal_Action, and Ideal_Agent_Turn.`);
+    if (!actions.includes(nextAction)) throw new Error(`Ideal behavior row ${index + 2} has an unsupported Ideal_Action: ${nextAction}.`);
+    const key = idealRowKey(id, number);
+    if (updates.has(key)) throw new Error(`Ideal behavior row ${index + 2} duplicates ${id} turn ${number}.`);
+    updates.set(key, { action: nextAction, reply: nextReply });
   });
-  if (!updates.size) throw new Error("No ideal behavior rows were found in that CSV.");
-  let applied = 0;
-  const conversations = dataset.conversations.map((conversation: Doc) => ({ ...conversation, idealRows: conversation.idealRows.map((row: Doc) => {
-    const update = updates.get(`${conversation.conversationId}:${row.turn}`);
-    if (!update) return row;
-    applied += 1;
-    const idealAction = update.action && actions.includes(update.action) ? update.action : row.idealAction;
-    return { ...row, idealAction, idealResponse: update.reply ?? (update.action ? idealReplyTemplate(idealAction) : row.idealResponse), idealOverride: true };
-  }) }));
-  if (!applied) throw new Error("No CSV rows matched this generated dataset. Check conversation_id and turn.");
-  return { ...dataset, conversations, updated_at: now() };
+
+  const expectedRows = dataset.conversations.flatMap((conversation: Doc) => conversation.idealRows.map((row: Doc) => ({ conversationId: conversation.conversationId, row })));
+  const expectedKeys = new Set(expectedRows.map(({ conversationId, row }: Doc) => idealRowKey(conversationId, row.turn)));
+  const unexpected = [...updates.keys()].find((key) => !expectedKeys.has(key));
+  if (unexpected) throw new Error(`The ideal behavior file contains ${unexpected}, which does not exist in this table.`);
+  const missing = expectedRows.find(({ conversationId, row }: Doc) => !updates.has(idealRowKey(conversationId, row.turn)));
+  if (missing) throw new Error(`The ideal behavior file must replace every row. It is missing ${missing.conversationId} turn ${missing.row.turn}. Download the template and include all rows.`);
+  if (updates.size !== expectedRows.length) throw new Error("The ideal behavior file must contain exactly one row for every table row.");
+
+  const conversations = dataset.conversations.map((conversation: Doc) => ({
+    ...conversation,
+    idealRows: conversation.idealRows.map((row: Doc) => {
+      const update = updates.get(idealRowKey(conversation.conversationId, row.turn))!;
+      // Replace the whole ideal record, rather than patching selected fields.
+      // Caller and actual turns remain the source dataset and are intentionally
+      // not overwritten by an ideal-behavior import.
+      return {
+        ...row,
+        suggestedAction: update.action,
+        idealAction: update.action,
+        idealResponse: update.reply,
+        idealOverride: true,
+        generatedFromPrompts: false,
+      };
+    }),
+  }));
+  const overriddenAt = now();
+  return {
+    ...dataset,
+    conversations,
+    idealGeneration: {
+      ...(dataset.idealGeneration ?? {}),
+      sources: ["Uploaded ideal behavior table"],
+      overriddenAt,
+      generatedAt: dataset.idealGeneration?.generatedAt ?? overriddenAt,
+      model: dataset.idealGeneration?.model ?? null,
+    },
+    updated_at: overriddenAt,
+  };
 }
 
 function actionFor(text: string) { const lower = text.toLowerCase(); if (lower.includes("company_resolver")) return "CALL_COMPANY_RESOLVER"; if (lower.includes("information_extractor")) return "CALL_INFORMATION_EXTRACTOR"; if (/(thanks for calling|shareholder services at computershare|quick details).{0,180}(shareholder|calling on behalf)/.test(lower)) return "GIVE_FULL_INTRODUCTION"; if (/(trouble locating|trouble finding|unable to locate).{0,100}(what do you need|help with|intent)/.test(lower)) return "HANDLE_COMPANY_LOOKUP_FAILURE"; if (/(representative|human agent|transfer you|connect you|senior agent|supervisor)/.test(lower)) return "TRANSFER"; if (/(shareholder.*(?:you|account)|are you.*shareholder)/.test(lower)) return "ASK_SHAREHOLDER_STATUS"; if (/(how.*related|relationship.*shareholder|what.*relationship)/.test(lower)) return "ASK_RELATIONSHIP"; if (/(multiple|more than one).{0,30}company|which company.{0,35}(focus|first)/.test(lower)) return "ASK_COMPANY_FOCUS"; if (/(which|what).{0,30}company|company.{0,30}(calling|about)/.test(lower)) return "ASK_FOR_COMPANY"; if (/(i found|is that the company|confirm.*company)/.test(lower)) return "CONFIRM_COMPANY"; if (/(multiple|more than one).{0,30}(request|intent)|which.{0,30}(prioriti[sz]e|first)/.test(lower)) return "ASK_INTENT_PRIORITY"; if (/(what do you need help|how can.*help|reason.*calling|what.*help with)/.test(lower)) return "ASK_INTENT"; if (/(just to confirm|to summarize|summary.*(?:correct|right))/.test(lower)) return "GIVE_FINAL_SUMMARY"; if (/(is that correct|does that sound right|confirm that)/.test(lower)) return "ASK_FINAL_CONFIRMATION"; return "ACKNOWLEDGE"; }
@@ -552,14 +554,15 @@ async function analyze(store: Store, datasetId: string, payload: Doc) {
 }
 
 export async function localRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const store = read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc;
+  const store = read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc; let shouldPersist = true;
   if (url === "/api/prompts" && options.method === "POST") { if (!payload.name?.trim() || !payload.text?.trim() || !["global", "node"].includes(payload.source)) throw new Error("Prompt name, source, and text are required."); if (payload.source === "node" && !payload.node_name?.trim()) throw new Error("A node prompt needs a node name."); store.prompts ??= []; if (payload.set_active) store.prompts.forEach((item) => { if (item.source === payload.source) item.active = false; }); const version = Math.max(0, ...store.prompts.filter((item) => item.source === payload.source).map((item) => item.version ?? 0)) + 1; result = make("prompt", { ...payload, blocks: blocks(payload.source, payload.text) }, version, Boolean(payload.set_active)); store.prompts.unshift(result); }
   else if (url === "/api/metrics" && options.method === "POST") { result = make("metric", payload, store.metrics.length + 1); store.metrics.unshift(result); }
   else if (/^\/api\/metrics\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.metrics.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Metric not found."); const old = store.metrics[index]; result = make("metric", { ...payload, isDefault: old.isDefault ?? false, definition_id: old.definition_id ?? old.id }, old.version + 1); store.metrics[index] = result; }
   else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", await buildDataset(store, payload), store.datasets.length + 1); store.datasets.unshift(result); }
-  else if (/^\/api\/datasets\/[^/]+\/generate-ideals$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = await applyPromptGeneratedIdeals(store.datasets[index], selectedPrompts(store, payload), payload.preserve_manual_overrides !== false); store.datasets[index] = result; }
+  else if (/^\/api\/datasets\/[^/]+\/generate-ideals$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = await applyPromptGeneratedIdeals(store.datasets[index], selectedPrompts(store), payload.preserve_manual_overrides !== false); store.datasets[index] = result; }
+  else if (/^\/api\/datasets\/[^/]+\/ideal-table\/preview$/.test(url) && options.method === "POST") { const parts = url.split("/"); const dataset = store.datasets.find((item) => item.id === parts[3]); if (!dataset) throw new Error("Dataset not found."); result = applyIdealTableCsv(dataset, payload.ideal_behavior_csv ?? ""); shouldPersist = false; }
   else if (/^\/api\/datasets\/[^/]+\/ideal-table$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = applyIdealTableCsv(store.datasets[index], payload.ideal_behavior_csv ?? ""); store.datasets[index] = result; }
   else if (/^\/api\/datasets\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.datasets.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Dataset not found."); result = { ...store.datasets[index], ...payload, updated_at: now() }; store.datasets[index] = result; }
   else { const match = url.match(/^\/api\/datasets\/([^/]+)\/analyze$/); if (!match || options.method !== "POST") throw new Error("This action is not available locally."); result = await analyze(store, match[1], payload); }
-  write(store); return result as T;
+  if (shouldPersist) write(store); return result as T;
 }
