@@ -474,15 +474,6 @@ const actionKeywords: Record<string, string[]> = {
   TRANSFER: ["escalat", "transfer", "senior"],
 };
 
-function metricBlocks(metrics: Doc[]) {
-  return metrics.flatMap((metric) => blocks("metric", metric.criteria ?? "").map((block: Doc) => ({
-    ...block,
-    promptName: metric.name,
-    promptVersion: metric.version,
-    sourceLabel: `Metric criteria · ${metric.name}`,
-  })));
-}
-
 function promptBlocks(prompts: Doc[]) {
   return prompts.flatMap((prompt) => (prompt.blocks ?? blocks(prompt.source, prompt.text ?? "")).map((block: Doc) => ({
     ...block,
@@ -500,16 +491,31 @@ function blockForAction(action: string, blocks: Doc[]) {
 
 const traceStopWords = new Set(["about", "after", "agent", "and", "are", "before", "caller", "calling", "company", "continue", "does", "for", "from", "have", "help", "into", "is", "it", "must", "not", "of", "on", "or", "the", "then", "to", "use", "with", "you", "your"]);
 function traceTerms(value: string) { return [...new Set((value.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) ?? []).filter((word) => !traceStopWords.has(word)))]; }
-function topSourcesFor(actualAction: string, expectedAction: string, actualResponse: string, blocks: Doc[]): Doc[] {
+function policyMatchConfidence(actionHits: number, responseHits: number, expectedHits: number) {
+  // This is a textual-alignment confidence, not an evaluation-quality score.
+  // A direct action match is the strongest signal; response and expected-action
+  // wording add supporting confidence without making a weak match look certain.
+  const actionSignal = actionHits ? 0.55 + Math.min(0.2, (actionHits - 1) * 0.1) : 0;
+  const responseSignal = Math.min(0.15, responseHits * 0.05);
+  const expectedSignal = Math.min(0.1, expectedHits * 0.05);
+  return Math.round(Math.min(0.95, actionSignal + responseSignal + expectedSignal) * 100) / 100;
+}
+
+function policyMatchesFor(actualAction: string, expectedAction: string, actualResponse: string, blocks: Doc[]): Doc[] {
   const actionTerms = new Set([...(actionKeywords[actualAction] ?? []), ...traceTerms(actualAction.replaceAll("_", " "))].map((word) => word.toLowerCase()));
   const responseTerms = new Set(traceTerms(actualResponse));
   const expectedTerms = new Set([...(actionKeywords[expectedAction] ?? []), ...traceTerms(expectedAction.replaceAll("_", " "))].map((word) => word.toLowerCase()));
   return blocks.map((block: Doc) => {
     const text = block.text.toLowerCase();
-    const actionHits = [...actionTerms].filter((term) => text.includes(term)).length;
-    const responseHits = [...responseTerms].filter((term) => text.includes(term)).length;
-    const expectedHits = [...expectedTerms].filter((term) => text.includes(term)).length;
-    return { ...block, relevance: actionHits * 5 + responseHits * 2 + expectedHits, actionHits, responseHits, expectedHits };
+    const actionMatches = [...actionTerms].filter((term) => text.includes(term));
+    const responseMatches = [...responseTerms].filter((term) => text.includes(term));
+    const expectedMatches = [...expectedTerms].filter((term) => text.includes(term));
+    const actionHits = actionMatches.length;
+    const responseHits = responseMatches.length;
+    const expectedHits = expectedMatches.length;
+    const relevance = actionHits * 5 + responseHits * 2 + expectedHits;
+    const matchTerms = [...new Set([...actionMatches, ...responseMatches, ...expectedMatches])].slice(0, 8);
+    return { ...block, relevance, confidence: policyMatchConfidence(actionHits, responseHits, expectedHits), matchTerms };
   }).filter((block: Doc) => block.relevance > 0).sort((left: Doc, right: Doc) => right.relevance - left.relevance || left.lineStart - right.lineStart).slice(0, 3);
 }
 
@@ -524,16 +530,16 @@ function improvementFor(expectedAction: string, actualAction: string) {
   return preserve[actualAction] ?? `Add an explicit instruction: "After reviewing the full conversation state, ${expectedAction.replaceAll("_", " ").toLowerCase()} before taking any later workflow step."`;
 }
 
-function traceFor(expectedAction: string, actualAction: string, actualResponse: string, blocks: Doc[]) {
-  const promptLine = blockForAction(expectedAction, blocks);
-  const problematicInstruction = blockForAction(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, blocks);
-  const topSources = topSourcesFor(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, expectedAction, actualResponse, blocks);
+function traceFor(expectedAction: string, actualAction: string, actualResponse: string, policyBlocks: Doc[]) {
+  const promptLine = blockForAction(expectedAction, policyBlocks);
+  const problematicInstruction = blockForAction(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, policyBlocks);
+  const policyMatches = policyMatchesFor(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, expectedAction, actualResponse, policyBlocks);
   return {
     expectedAction,
     actualAction,
     promptLine,
     problematicInstruction,
-    topSources,
+    policyMatches,
     improvement: expectedAction === actualAction || actualAction === "ACKNOWLEDGE" ? null : improvementFor(expectedAction, actualAction),
   };
 }
@@ -550,7 +556,7 @@ function promptsForAnalysis(store: Store, payload: Doc, dataset: Doc) {
 
 async function analyze(store: Store, datasetId: string, payload: Doc) {
   const dataset = store.datasets.find((item) => item.id === datasetId); if (!dataset) throw new Error("Dataset not found."); const conversations = dataset.conversations.filter((item: Doc) => item.actualTurns?.length); if (!conversations.length) throw new Error("This dataset has no matching actual-agent turns.");
-  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id)); const prompts = promptsForAnalysis(store, payload, dataset); const evidenceBlocks = [...promptBlocks(prompts), ...metricBlocks(metrics)]; const runs = await Promise.all(conversations.map(async (conversation: Doc) => { const ideal = idealTurns(conversation); let callerIndex = -1; const actions = conversation.actualTurns.filter((turn: Turn) => turn.role === "agent").map((turn: Turn) => { callerIndex += 1; const row = conversation.idealRows[callerIndex] ?? {}; const expectedAction = selectedAction(row); const actualAction = actionFor(turn.content); return { turn: turn.index + 1, callerInput: row.userTurn ?? "", agentResponse: turn.content, expectedAction, actualAction, decision: actualAction === expectedAction || actualAction === "ACKNOWLEDGE" ? "CORRECT" : "INCORRECT", promptTrace: traceFor(expectedAction, actualAction, turn.content, evidenceBlocks) }; }); const results = await Promise.all(metrics.map(async (metric) => { if (metric.implementation_key) { const [value, reason, break_turn] = score(metric.implementation_key, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: value, status: value >= metric.threshold ? "PASS" : "FAIL", reason, break_turn }; } try { const judged = await llmMetric(metric, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: judged.score, status: judged.score >= metric.threshold ? "PASS" : "FAIL", reason: judged.reason }; } catch (error) { return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run." }; } })); const scored = results.filter((result) => result.score != null); const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null; const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: weightedScore == null ? "NOT_RUN" : weightedScore >= .8 ? "PASS" : "FAIL", weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, idealTranscript: ideal, actionTrace: actions, breaks: actions.filter((item: Doc) => item.decision === "INCORRECT").map((item: Doc) => ({ turn: item.turn, expectedAction: item.expectedAction, actualAction: item.actualAction, severity: "HIGH", suggestedFix: `The selected ideal next action is ${String(item.expectedAction).replaceAll("_", " ").toLowerCase()}.` })), sources: { policy: prompts.map(promptSourceLabel), criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1); store.runs.unshift(report); return report; })); return { datasetId, runs };
+  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id)); const prompts = promptsForAnalysis(store, payload, dataset); const policyBlocks = promptBlocks(prompts); const runs = await Promise.all(conversations.map(async (conversation: Doc) => { const ideal = idealTurns(conversation); let callerIndex = -1; const actions = conversation.actualTurns.filter((turn: Turn) => turn.role === "agent").map((turn: Turn) => { callerIndex += 1; const row = conversation.idealRows[callerIndex] ?? {}; const expectedAction = selectedAction(row); const actualAction = actionFor(turn.content); return { turn: turn.index + 1, callerInput: row.userTurn ?? "", agentResponse: turn.content, expectedAction, actualAction, decision: actualAction === expectedAction || actualAction === "ACKNOWLEDGE" ? "CORRECT" : "INCORRECT", promptTrace: traceFor(expectedAction, actualAction, turn.content, policyBlocks) }; }); const results = await Promise.all(metrics.map(async (metric) => { if (metric.implementation_key) { const [value, reason, break_turn] = score(metric.implementation_key, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: value, status: value >= metric.threshold ? "PASS" : "FAIL", reason, break_turn }; } try { const judged = await llmMetric(metric, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: judged.score, status: judged.score >= metric.threshold ? "PASS" : "FAIL", reason: judged.reason }; } catch (error) { return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run." }; } })); const scored = results.filter((result) => result.score != null); const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null; const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: weightedScore == null ? "NOT_RUN" : weightedScore >= .8 ? "PASS" : "FAIL", weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, idealTranscript: ideal, actionTrace: actions, breaks: actions.filter((item: Doc) => item.decision === "INCORRECT").map((item: Doc) => ({ turn: item.turn, expectedAction: item.expectedAction, actualAction: item.actualAction, severity: "HIGH", suggestedFix: `The selected ideal next action is ${String(item.expectedAction).replaceAll("_", " ").toLowerCase()}.` })), sources: { policy: prompts.map(promptSourceLabel), criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1); store.runs.unshift(report); return report; })); return { datasetId, runs };
 }
 
 export async function localRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
