@@ -1,12 +1,12 @@
 export type Doc = Record<string, any>;
 
-type Store = { flowVersion?: number; metricCatalogVersion?: number; prompts?: Doc[]; datasets: Doc[]; metrics: Doc[]; runs: Doc[] };
+type PromptMode = "pathway" | "assistant";
+type Store = { flowVersion?: number; metricCatalogVersion?: number; promptMode?: PromptMode; prompts?: Doc[]; datasets: Doc[]; metrics: Doc[]; runs: Doc[] };
 type Turn = { id: string; index: number; role: "caller" | "agent" | "tool" | "tool_result"; content: string };
 
 const key = "cpu-evaluator-local-v2";
-const flowVersion = 7;
+const flowVersion = 10;
 const metricCatalogVersion = 3;
-const actions = ["GIVE_FULL_INTRODUCTION", "ASK_SHAREHOLDER_STATUS", "ASK_RELATIONSHIP", "ASK_FOR_COMPANY", "CALL_COMPANY_RESOLVER", "ASK_COMPANY_FOCUS", "HANDLE_COMPANY_LOOKUP_FAILURE", "ASK_INTENT", "ASK_INTENT_PRIORITY", "GIVE_FINAL_SUMMARY", "ASK_FINAL_CONFIRMATION", "CALL_INFORMATION_EXTRACTOR", "TRANSFER"];
 const defaultMetricSeeds: Array<[string, string]> = [
   [
     "Full Introduction Adherence",
@@ -181,7 +181,7 @@ const blocks = (source: string, text: string) => text.split(/\r?\n/).map((line, 
 
 function fresh(): Store {
   const metrics = defaultMetricSeeds.map(([name, criteria], index) => make("metric", { name, type: "conversational_geval", description: "Default Computershare evaluation.", enabled: true, isDefault: true, threshold: .8, weight: 1, judge_model: "gpt-4.1-mini", criteria, implementation_key: null }, index + 1));
-  return { flowVersion, metricCatalogVersion, prompts: [], datasets: [], metrics, runs: [] };
+  return { flowVersion, metricCatalogVersion, promptMode: "pathway", prompts: [], datasets: [], metrics, runs: [] };
 }
 
 function ensureMetricCatalog(store: Store) {
@@ -196,12 +196,27 @@ function ensureMetricCatalog(store: Store) {
 
 function read(): Store {
   if (typeof window === "undefined") return fresh();
-  try { const value = window.localStorage.getItem(key); if (value) { const saved = JSON.parse(value) as Store; let changed = false; if (!saved.prompts) { saved.prompts = []; changed = true; } if (saved.flowVersion !== flowVersion) { saved.datasets = saved.datasets.map(rebuildSuggestions); saved.flowVersion = flowVersion; changed = true; } if (saved.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(saved); changed = true; } if (changed) write(saved); return saved; } } catch { /* reset malformed local state */ }
+  try { const value = window.localStorage.getItem(key); if (value) { const saved = JSON.parse(value) as Store; let changed = false; if (!saved.prompts) { saved.prompts = []; changed = true; } if (saved.promptMode !== "pathway" && saved.promptMode !== "assistant") { saved.promptMode = "pathway"; changed = true; } if (saved.flowVersion !== flowVersion) { saved.datasets = saved.datasets.map(removeIdealState); saved.runs = saved.runs.map(removeIdealStateFromRun); saved.flowVersion = flowVersion; changed = true; } if (saved.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(saved); changed = true; } if (changed) write(saved); return saved; } } catch { /* reset malformed local state */ }
   const initial = fresh(); write(initial); return initial;
 }
 function write(store: Store) { if (typeof window !== "undefined") window.localStorage.setItem(key, JSON.stringify(store)); }
 export function bootstrap(): Doc { const store = read(); return { ...store, secrets: [], judgeConfigured: true, dashboard: { latestScore: store.runs[0]?.weightedScore ?? null } }; }
-export const idealActions = actions;
+
+function removeIdealState(dataset: Doc): Doc {
+  const { idealGeneration: _idealGeneration, ...rest } = dataset;
+  return { ...rest, conversations: (dataset.conversations ?? []).map((conversation: Doc) => {
+    const { idealRows: _idealRows, ...remaining } = conversation;
+    return remaining;
+  }) };
+}
+
+function removeIdealStateFromRun(run: Doc): Doc {
+  const { idealTranscript: _idealTranscript, actionTrace: _actionTrace, breaks: _breaks, ...remaining } = run;
+  return { ...remaining, metricResults: (remaining.metricResults ?? []).map((metric: Doc) => {
+    const { promptTrace: _promptTrace, ...result } = metric;
+    return result;
+  }) };
+}
 
 function rowValues(csv: string): string[][] {
   const values: string[][] = []; let row: string[] = []; let field = ""; let quote = false;
@@ -219,49 +234,15 @@ function csvGroups(csv: string, kind: "user" | "actual") {
 }
 
 const relationship = (value: string) => value.match(/\b(grandmother|grandfather|grandparent|mother|father|mom|dad|son|daughter|grandson|granddaughter|nephew|niece|wife|husband|spouse|sister|brother|aunt|uncle|family|executor|trustee|advisor|broker)\b/i)?.[1] ?? null;
-const shareholderStatus = (value: string): "yes" | "no" | null => {
-  if (/\b(no|not|isn't|am not|i'm not)\b[^.?!]{0,30}\bshareholder\b|\bcalling on behalf of\b/i.test(value)) return "no";
-  // In response to the status question, callers often answer with just
-  // "shareholder" rather than a complete sentence. That is an affirmative
-  // status and should advance the flow to collecting the company (F2).
-  if (/^\s*(?:yes[,.]?\s*)?(?:(?:i am|i'm|im)\s+)?(?:a\s+|the\s+)?shareholder\s*[.!?]*\s*$/i.test(value)) return "yes";
-  return /\b(i am|i'm|the)\b[^.?!]{0,30}\bshareholder\b|\byes\b[^.?!]{0,30}\bshareholder\b/i.test(value) ? "yes" : null;
-};
-const negative = (value: string) => /^\s*(no|nope|nah)\W*\s*$/i.test(value);
-const shareholderRefusal = (value: string) => /\b(refuse|won't|will not|don't want|do not want|rather not|none of your business|not telling|can't say)\b/i.test(value);
 const companies = (value: string) => {
   if (relationship(value)) return [];
   const explicit = [...value.matchAll(/(?:company|regarding|about|with)\s+(?:is\s+)?([A-Z][A-Za-z& .,'-]{1,80}?)(?=(?:\s+(?:and|or)\s+)|[,.!?]|$)/g)].map((match) => match[1].trim().replace(/[. ]+$/, ""));
   const named = [...value.matchAll(/\b([A-Z][A-Za-z& .,'-]{2,80}?(?:Corporation|Corp\.?|Inc\.?|Ltd\.?|LLC|PLC|Company))\b/g)].map((match) => match[1].trim().replace(/^(?:no,?\s+)?(?:it is|it's)\s+/i, "").replace(/[. ]+$/, ""));
   return [...new Set([...explicit, ...named].filter((item) => item.length > 1))];
 };
-const simpleCompanyReply = (value: string) => {
-  const candidate = value.trim().replace(/[.!?]+$/, "").replace(/^(?:it(?:'s| is)|the company (?:is|was)|company(?: name)? (?:is|was)|i think (?:it's|it is))\s+/i, "").trim();
-  if (!candidate || candidate.length > 80 || !/^[A-Za-z0-9&.,' -]+$/.test(candidate) || /\b(no|yes|don't know|do not know|not sure|no idea|can't|cannot|help|shareholder|relationship)\b/i.test(candidate)) return [];
-  const names = candidate.split(/\s+(?:and|or)\s+/i).map((item) => item.trim()).filter(Boolean);
-  return names.length && names.every((item) => /^[A-Za-z0-9][A-Za-z0-9&.,' -]{1,80}$/.test(item)) ? names : [];
-};
-const companiesForTurn = (value: string, previousAction: string) => {
-  const detected = companies(value);
-  return detected.length || !["ASK_FOR_COMPANY", "ASK_COMPANY_FOCUS"].includes(previousAction) ? detected : simpleCompanyReply(value);
-};
-const companySearchFailure = (value: string) => /\b(don't know|do not know|not sure|no idea|can't find|cannot find|can't locate|cannot locate|unable to (?:find|locate)|trying to (?:find|locate))\b/i.test(value);
 const company = (value: string) => companies(value)[0] ?? null;
 const intents = (value: string) => { const found = [...new Set([...value.matchAll(/\b(transfer|sell|buy|dividend|certificate|address|tax|payment|shares?|proxy|vote|estate|inherit|account)\b/gi)].map((match) => match[1].toLowerCase()))]; const specific = found.filter((item) => !["share", "shares", "payment", "account"].includes(item)); return specific.length ? specific : found.filter((item) => !["share", "shares"].includes(item)); };
 const intent = (value: string) => intents(value)[0] ?? null;
-const nextAction = (state: Doc) => state.shareholderStatus === "unknown" ? state.shareholderRefusals >= 2 ? "TRANSFER" : !state.openingDelivered && !state.hasUsableCallerData ? "GIVE_FULL_INTRODUCTION" : "ASK_SHAREHOLDER_STATUS" : state.shareholderStatus === "no" && !state.relationship ? "ASK_RELATIONSHIP" : state.multipleCompanies ? "ASK_COMPANY_FOCUS" : state.companyTrouble && !state.companyBypassed ? "HANDLE_COMPANY_LOOKUP_FAILURE" : !state.company && !state.companyBypassed ? "ASK_FOR_COMPANY" : !state.companyConfirmed && !state.companyBypassed ? "CALL_COMPANY_RESOLVER" : state.multipleIntents ? "ASK_INTENT_PRIORITY" : !state.intent ? "ASK_INTENT" : !state.summary ? "GIVE_FINAL_SUMMARY" : !state.finalConfirmation ? "ASK_FINAL_CONFIRMATION" : "CALL_INFORMATION_EXTRACTOR";
-function responseFor(action: string, state: Doc) {
-  const companyName = state.company ?? "the company you mentioned"; const relationshipName = state.relationship ?? "the shareholder"; const intentName = state.intent ?? "your request";
-  return ({ GIVE_FULL_INTRODUCTION: "Thanks for calling Computershare Shareholder Services. I will collect a few quick details to get you to the right team. Are you the shareholder on the account, or calling on behalf of someone else?", ASK_SHAREHOLDER_STATUS: state.shareholderRefusals === 1 ? "I understand. To help you, I need to confirm whether you are the shareholder. Are you the shareholder on the account?" : "Are you the shareholder on the account, or calling on behalf of someone else?", ASK_RELATIONSHIP: "What is your relationship to the shareholder?", ASK_FOR_COMPANY: "Which company are you calling about?", CALL_COMPANY_RESOLVER: `Tool: company_resolver('${companyName}')\nTool result: ${companyName}\nAgent: I found ${companyName}. Is that the company you are calling about?`, ASK_COMPANY_FOCUS: "I heard more than one company. Which company would you like to focus on first?", HANDLE_COMPANY_LOOKUP_FAILURE: "It seems like we are having trouble locating the company, but that is okay. What do you need help with today?", ASK_INTENT: "What do you need help with today?", ASK_INTENT_PRIORITY: "I heard multiple requests. Which one would you like to prioritize first?", GIVE_FINAL_SUMMARY: `Just to confirm, you are calling on behalf of ${relationshipName} regarding ${companyName} and need help with ${intentName}. Is that correct?`, ASK_FINAL_CONFIRMATION: "Please confirm that summary is correct before I continue.", CALL_INFORMATION_EXTRACTOR: `information_extractor({ intent: '${intentName}' })`, TRANSFER: "I will connect you with a senior agent so they can help further." } as Record<string, string>)[action] ?? "";
-}
-export function idealReplyTemplate(action: string) {
-  return responseFor(action, {
-    shareholderRefusals: 0,
-    relationship: "the shareholder",
-    company: "the company you mentioned",
-    intent: "your request",
-  });
-}
 function buildDatasetShell(payload: Doc) {
   const combinedCsv = payload.turn_data_csv ?? payload.actual_agent_turn_csv;
   const userCsv = payload.user_turn_csv ?? combinedCsv;
@@ -269,174 +250,23 @@ function buildDatasetShell(payload: Doc) {
   if (!userCsv) throw new Error("Upload Actual Agent Turn Data with conversation_id, turn, user_turn, and agent_turn columns.");
   const users = csvGroups(userCsv, "user"); const actuals = actualCsv ? csvGroups(actualCsv, "actual") : new Map<string, Doc[]>();
   const conversations = [...users.entries()].map(([conversationId, userRows]) => {
-    // This only builds the uploaded conversation structure. Ideal rows are
-    // populated exclusively by the active prompt versions in /api/ideal.
-    const idealRows = userRows.map((row) => ({ id: uid(), turn: row.turn, userTurn: row.content, suggestedAction: "", idealAction: "", idealResponse: "", idealOverride: false }));
     const actualRows = actuals.get(conversationId) ?? [];
     const matching = new Map(actualRows.map((row) => [row.turn, row]));
     const actualTurns: Turn[] = [];
     userRows.forEach((row) => { const actual = matching.get(row.turn); actualTurns.push({ id: uid(), index: actualTurns.length, role: "caller", content: actual?.userContent || row.content }); if (actual) actualTurns.push({ id: uid(), index: actualTurns.length, role: "agent", content: actual.content }); });
-    return { conversationId, userRows, actualRows, idealRows, actualTurns, actualAttached: Boolean(actualRows.length) };
+    return { conversationId, userRows, actualRows, actualTurns, actualAttached: Boolean(actualRows.length) };
   });
   return { name: payload.name, source: "Actual Agent Turn Data CSV", conversations, conversationCount: conversations.length, actualConversationCount: conversations.filter((item) => item.actualAttached).length };
 }
 
-function selectedPrompts(store: Store) {
-  const all = store.prompts ?? [];
-  const global = all.find((prompt) => prompt.source === "global" && prompt.active);
-  const node = all.find((prompt) => prompt.source === "node" && prompt.active);
-  if (!global?.text?.trim()) throw new Error("Set an active global prompt before generating ideal behavior.");
-  return { global, node: node?.text?.trim() ? node : null };
-}
-
-function promptSourceLabel(prompt: Doc) {
-  return `${prompt.source === "global" ? "Global prompt" : `${prompt.node_name || "Node"} prompt`} · ${prompt.name} v${prompt.version}`;
-}
-
-async function promptGeneratedRows(userRows: Doc[], prompts: { global: Doc; node: Doc | null }) {
-  const response = await fetch("/api/ideal", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      globalPrompt: { name: prompts.global.name, version: prompts.global.version, text: prompts.global.text },
-      nodePrompt: prompts.node ? { name: prompts.node.name, nodeName: prompts.node.node_name, version: prompts.node.version, text: prompts.node.text } : null,
-      turns: userRows.map((row) => ({ turn: row.turn, userTurn: row.content })),
-    }),
-  });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.detail ?? "Ideal scenario generation failed.");
-  if (!Array.isArray(body.idealRows)) throw new Error("Ideal scenario generator returned an unreadable result.");
-  return userRows.map((row, index) => {
-    const ideal = body.idealRows[index];
-    if (!ideal || Number(ideal.turn) !== Number(row.turn) || !actions.includes(ideal.idealAction) || typeof ideal.idealResponse !== "string" || !ideal.idealResponse.trim()) throw new Error(`The ideal scenario generator did not return a valid row for turn ${row.turn}.`);
-    return { id: uid(), turn: row.turn, userTurn: row.content, suggestedAction: ideal.idealAction, idealAction: ideal.idealAction, idealResponse: ideal.idealResponse, idealOverride: false, generatedFromPrompts: true };
-  });
-}
-
-async function applyPromptGeneratedIdeals(dataset: Doc, prompts: { global: Doc; node: Doc | null }, preserveManualOverrides = false): Promise<Doc> {
-  const conversations = await Promise.all(dataset.conversations.map(async (conversation: Doc) => {
-    const generatedRows = await promptGeneratedRows(conversation.userRows, prompts);
-    const priorRows = new Map<string, Doc>((conversation.idealRows ?? []).map((row: Doc) => [String(row.turn), row]));
-    return {
-      ...conversation,
-      idealRows: generatedRows.map((row) => {
-        const prior = priorRows.get(String(row.turn));
-        return preserveManualOverrides && prior?.idealOverride ? { ...row, id: prior.id, idealAction: prior.idealAction, idealResponse: prior.idealResponse, idealOverride: true } : row;
-      }),
-    };
-  }));
-  return {
-    ...dataset,
-    conversations,
-    idealGeneration: {
-      sources: [promptSourceLabel(prompts.global), ...(prompts.node ? [promptSourceLabel(prompts.node)] : [])],
-      globalPromptId: prompts.global.id,
-      nodePromptId: prompts.node?.id ?? null,
-      generatedAt: now(),
-      model: "gpt-4.1-mini",
-    },
-    updated_at: now(),
-  };
-}
-
-async function buildDataset(store: Store, payload: Doc) {
-  const dataset = buildDatasetShell(payload);
-  return applyPromptGeneratedIdeals(dataset, selectedPrompts(store));
-}
-
-function csvCell(value: unknown) { const text = String(value ?? ""); return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
-function rebuildSuggestions(dataset: Doc): Doc {
-  const userRows = ["conversation_id,turn,user_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.userRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
-  const actualRows = ["conversation_id,turn,actual_agent_turn", ...dataset.conversations.flatMap((conversation: Doc) => conversation.actualRows.map((row: Doc) => [conversation.conversationId, row.turn, row.content].map(csvCell).join(",")))].join("\n");
-  const rebuilt = buildDatasetShell({ name: dataset.name, user_turn_csv: userRows, actual_turn_csv: dataset.conversations.some((conversation: Doc) => conversation.actualRows.length) ? actualRows : null });
-  const priorRows = new Map<string, Doc>(dataset.conversations.flatMap((conversation: Doc) => conversation.idealRows.map((row: Doc) => [`${conversation.conversationId}:${row.turn}`, row] as [string, Doc])));
-  rebuilt.conversations.forEach((conversation: Doc) => conversation.idealRows.forEach((row: Doc) => {
-    const prior = priorRows.get(`${conversation.conversationId}:${row.turn}`);
-    // Dataset reconstruction must never replace prompt-generated ideals with
-    // local flow suggestions. Keep every previously generated or edited row.
-    if (prior) Object.assign(row, {
-      id: prior.id,
-      suggestedAction: prior.suggestedAction,
-      idealAction: prior.idealAction,
-      idealResponse: prior.idealResponse,
-      idealOverride: prior.idealOverride,
-      generatedFromPrompts: prior.generatedFromPrompts,
-    });
-  }));
-  return { ...dataset, ...rebuilt, updated_at: now() };
-}
-
-function idealRowKey(conversationId: unknown, turn: unknown) {
-  const id = String(conversationId ?? "").trim();
-  const rawTurn = String(turn ?? "").trim();
-  const asNumber = Number(rawTurn);
-  const normalizedTurn = rawTurn && Number.isFinite(asNumber) ? String(asNumber) : rawTurn;
-  return `${id}:${normalizedTurn}`;
-}
-
-function applyIdealTableCsv(dataset: Doc, csv: string): Doc {
-  const values = rowValues(csv.replace(/^\uFEFF/, ""));
-  if (values.length < 2) throw new Error("Ideal behavior CSV needs a header row and at least one data row.");
-  const headers = values[0].map(header);
-  const at = (candidates: string[]) => headers.findIndex((value) => candidates.includes(value));
-  const conversation = at(["conversationid", "callid", "sessionid", "id"]);
-  const turn = at(["turn", "turnnumber", "turnid", "sequence", "index", "order"]);
-  const action = at(["idealaction", "idealnextaction", "action"]);
-  const reply = at(["idealagentturn", "idealresponse", "idealbehavior", "idealbehaviour", "idealreply"]);
-  if (conversation < 0 || turn < 0 || action < 0 || reply < 0) throw new Error("The ideal behavior file requires Conversation ID, Turn, Ideal_Action, and Ideal_Agent_Turn columns.");
-
-  const updates = new Map<string, { action: string; reply: string }>();
-  values.slice(1).forEach((value, index) => {
-    const id = value[conversation]?.trim();
-    const number = value[turn]?.trim();
-    const nextAction = value[action]?.trim();
-    const nextReply = value[reply]?.trim();
-    if (!id && !number && !nextAction && !nextReply) return;
-    if (!id || !number || !nextAction || !nextReply) throw new Error(`Ideal behavior row ${index + 2} must include Conversation ID, Turn, Ideal_Action, and Ideal_Agent_Turn.`);
-    if (!actions.includes(nextAction)) throw new Error(`Ideal behavior row ${index + 2} has an unsupported Ideal_Action: ${nextAction}.`);
-    const key = idealRowKey(id, number);
-    if (updates.has(key)) throw new Error(`Ideal behavior row ${index + 2} duplicates ${id} turn ${number}.`);
-    updates.set(key, { action: nextAction, reply: nextReply });
-  });
-
-  const expectedRows = dataset.conversations.flatMap((conversation: Doc) => conversation.idealRows.map((row: Doc) => ({ conversationId: conversation.conversationId, row })));
-  const expectedKeys = new Set(expectedRows.map(({ conversationId, row }: Doc) => idealRowKey(conversationId, row.turn)));
-  const unexpected = [...updates.keys()].find((key) => !expectedKeys.has(key));
-  if (unexpected) throw new Error(`The ideal behavior file contains ${unexpected}, which does not exist in this table.`);
-  const missing = expectedRows.find(({ conversationId, row }: Doc) => !updates.has(idealRowKey(conversationId, row.turn)));
-  if (missing) throw new Error(`The ideal behavior file must replace every row. It is missing ${missing.conversationId} turn ${missing.row.turn}. Download the template and include all rows.`);
-  if (updates.size !== expectedRows.length) throw new Error("The ideal behavior file must contain exactly one row for every table row.");
-
-  const conversations = dataset.conversations.map((conversation: Doc) => ({
-    ...conversation,
-    idealRows: conversation.idealRows.map((row: Doc) => {
-      const update = updates.get(idealRowKey(conversation.conversationId, row.turn))!;
-      // Replace the whole ideal record, rather than patching selected fields.
-      // Caller and actual turns remain the source dataset and are intentionally
-      // not overwritten by an ideal-behavior import.
-      return {
-        ...row,
-        suggestedAction: update.action,
-        idealAction: update.action,
-        idealResponse: update.reply,
-        idealOverride: true,
-        generatedFromPrompts: false,
-      };
-    }),
-  }));
-  const overriddenAt = now();
-  return {
-    ...dataset,
-    conversations,
-    idealGeneration: {
-      ...(dataset.idealGeneration ?? {}),
-      sources: ["Uploaded ideal behavior table"],
-      overriddenAt,
-      generatedAt: dataset.idealGeneration?.generatedAt ?? overriddenAt,
-      model: dataset.idealGeneration?.model ?? null,
-    },
-    updated_at: overriddenAt,
-  };
+function activePolicy(store: Store) {
+  const prompts = store.prompts ?? [];
+  if (store.promptMode === "assistant") {
+    const assistant = prompts.find((prompt) => prompt.source === "assistant" && prompt.active);
+    return assistant?.text?.trim() ? `Assistant prompt · ${assistant.name}\n${assistant.text.trim()}` : "No active assistant prompt.";
+  }
+  const pathwayPrompts = prompts.filter((prompt) => (prompt.source === "global" || prompt.source === "node") && prompt.active);
+  return pathwayPrompts.map((prompt) => `${prompt.source === "global" ? "Global" : `${prompt.node_name || "Node"}`} prompt · ${prompt.name}\n${prompt.text?.trim() ?? ""}`).join("\n\n") || "No active pathway prompt.";
 }
 
 function actionFor(text: string) { const lower = text.toLowerCase(); if (lower.includes("company_resolver")) return "CALL_COMPANY_RESOLVER"; if (lower.includes("information_extractor")) return "CALL_INFORMATION_EXTRACTOR"; if (/(thanks for calling|shareholder services at computershare|quick details).{0,180}(shareholder|calling on behalf)/.test(lower)) return "GIVE_FULL_INTRODUCTION"; if (/(trouble locating|trouble finding|unable to locate).{0,100}(what do you need|help with|intent)/.test(lower)) return "HANDLE_COMPANY_LOOKUP_FAILURE"; if (/(representative|human agent|transfer you|connect you|senior agent|supervisor)/.test(lower)) return "TRANSFER"; if (/(shareholder.*(?:you|account)|are you.*shareholder)/.test(lower)) return "ASK_SHAREHOLDER_STATUS"; if (/(how.*related|relationship.*shareholder|what.*relationship)/.test(lower)) return "ASK_RELATIONSHIP"; if (/(multiple|more than one).{0,30}company|which company.{0,35}(focus|first)/.test(lower)) return "ASK_COMPANY_FOCUS"; if (/(which|what).{0,30}company|company.{0,30}(calling|about)/.test(lower)) return "ASK_FOR_COMPANY"; if (/(i found|is that the company|confirm.*company)/.test(lower)) return "CONFIRM_COMPANY"; if (/(multiple|more than one).{0,30}(request|intent)|which.{0,30}(prioriti[sz]e|first)/.test(lower)) return "ASK_INTENT_PRIORITY"; if (/(what do you need help|how can.*help|reason.*calling|what.*help with)/.test(lower)) return "ASK_INTENT"; if (/(just to confirm|to summarize|summary.*(?:correct|right))/.test(lower)) return "GIVE_FINAL_SUMMARY"; if (/(is that correct|does that sound right|confirm that)/.test(lower)) return "ASK_FINAL_CONFIRMATION"; return "ACKNOWLEDGE"; }
@@ -446,128 +276,58 @@ function score(keyName: string, turns: Turn[]): [number, string, number | null] 
   if (keyName === "context_preservation" || keyName === "intent_capture") return fail((turn) => (hasRelationship && actionFor(turn.content) === "ASK_RELATIONSHIP") || (hasCompany && actionFor(turn.content) === "ASK_FOR_COMPANY") || (hasIntent && actionFor(turn.content) === "ASK_INTENT"), "The agent asked for information already supplied by the caller.") ?? [1, "No repeated supplied field was observed.", null];
   if (keyName === "relationship_handling") return fail((turn) => hasRelationship && actionFor(turn.content) === "ASK_RELATIONSHIP", "A supplied relationship was requested again.") ?? [1, "Relationship input was not re-requested.", null];
   if (keyName === "workflow_order") return fail((turn) => (!hasRelationship && ["ASK_FOR_COMPANY", "ASK_INTENT", "GIVE_FINAL_SUMMARY"].includes(actionFor(turn.content))) || (hasRelationship && !hasCompany && ["ASK_INTENT", "GIVE_FINAL_SUMMARY"].includes(actionFor(turn.content))), "The workflow advanced before an earlier field was resolved.") ?? [1, "Observed actions respect the CPU sequence.", null];
-  if (keyName === "company_resolution" || keyName === "company_resolver_max_two") { const calls = turns.filter((turn) => turn.role === "agent" && (turn.content.includes("company_resolver") || actionFor(turn.content) === "CONFIRM_COMPANY")); return calls.length > 2 ? [0, `Company resolution was confirmed ${calls.length} times; the maximum is two.`, calls[2].index + 1] : [1, "Company resolver use is trace-compliant where observable.", null]; }
+  if (keyName === "company_resolution" || keyName === "company_resolver_max_two") { const calls = turns.filter((turn) => turn.role === "agent" && (turn.content.includes("company_resolver") || actionFor(turn.content) === "CONFIRM_COMPANY")); return calls.length > 2 ? [0, `Company resolution was confirmed ${calls.length} times; the maximum is two.`, calls[2].index + 1] : [1, "Company resolver use is compliant where observable.", null]; }
   if (keyName === "final_handoff") { const handoff = turns.find((turn) => turn.content.includes("information_extractor")); return handoff && !caller.some((turn) => affirmative(turn.content)) ? [0, "Final handoff occurred before explicit confirmation.", handoff.index + 1] : [1, "No premature final handoff was observed.", null]; }
   if (keyName === "escalation") return caller.some((turn) => /\b(human|representative|supervisor)\b/i.test(turn.content)) && !agent.some((turn) => actionFor(turn.content) === "TRANSFER") ? [0, "The caller asked for a human representative but no transfer response was observed.", null] : [1, "Escalation behavior is compliant.", null];
   return [1, "Deterministic check completed.", null];
 }
-function selectedAction(row: Doc) { return row.idealAction || row.suggestedAction; }
-function idealTurns(conversation: Doc): Turn[] { const output: Turn[] = []; conversation.idealRows.forEach((row: Doc) => { output.push({ id: uid(), index: output.length, role: "caller", content: row.userTurn }); output.push({ id: uid(), index: output.length, role: selectedAction(row).startsWith("CALL_") ? "tool" : "agent", content: row.idealResponse }); }); return output; }
-async function llmMetric(metric: Doc, turns: Turn[]) {
-  const response = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ criteria: metric.criteria, model: metric.judge_model, transcript: turns.filter((turn) => turn.role !== "tool").map((turn) => `${turn.role === "caller" ? "Caller" : "Agent"}: ${turn.content}`).join("\n") }) });
-  const body = await response.json(); if (!response.ok) throw new Error(body.detail ?? "LLM judge failed."); return body as { score: number; reason: string };
+function scoreStatus(value: number | null) {
+  if (value == null) return "NOT_RUN";
+  if (value > .8) return "PASS";
+  if (value >= .5) return "PARTIAL PASS";
+  return "FAIL";
 }
 
-const actionKeywords: Record<string, string[]> = {
-  GIVE_FULL_INTRODUCTION: ["introduction", "opening", "shareholder", "get you to the right team"],
-  ASK_SHAREHOLDER_STATUS: ["shareholder", "F1", "status"],
-  ASK_RELATIONSHIP: ["relationship", "family", "grandmother", "non-shareholder", "F1"],
-  ASK_FOR_COMPANY: ["company", "F2"],
-  CALL_COMPANY_RESOLVER: ["company_resolver", "resolve", "company", "F2"],
-  ASK_COMPANY_FOCUS: ["company", "focus", "multiple"],
-  HANDLE_COMPANY_LOOKUP_FAILURE: ["company", "failed", "failure", "clarify"],
-  ASK_INTENT: ["intent", "F3", "help"],
-  ASK_INTENT_PRIORITY: ["intent", "prioritized", "multiple"],
-  GIVE_FINAL_SUMMARY: ["summary", "relationship", "company", "intent"],
-  ASK_FINAL_CONFIRMATION: ["confirmation", "confirm", "summary"],
-  CALL_INFORMATION_EXTRACTOR: ["information_extractor", "confirmation", "summary"],
-  TRANSFER: ["escalat", "transfer", "senior"],
-};
-
-function promptBlocks(prompts: Doc[]) {
-  return prompts.flatMap((prompt) => (prompt.blocks ?? blocks(prompt.source, prompt.text ?? "")).map((block: Doc) => ({
-    ...block,
-    promptName: prompt.name,
-    promptVersion: prompt.version,
-    sourceLabel: promptSourceLabel(prompt),
-  })));
-}
-
-function blockForAction(action: string, blocks: Doc[]) {
-  const keywords = actionKeywords[action] ?? [];
-  return blocks.map((block) => ({ block, relevance: keywords.reduce((total, keyword) => total + (block.text.toLowerCase().includes(keyword.toLowerCase()) ? 1 : 0), 0) }))
-    .sort((left, right) => right.relevance - left.relevance)[0]?.block ?? null;
-}
-
-const traceStopWords = new Set(["about", "after", "agent", "and", "are", "before", "caller", "calling", "company", "continue", "does", "for", "from", "have", "help", "into", "is", "it", "must", "not", "of", "on", "or", "the", "then", "to", "use", "with", "you", "your"]);
-function traceTerms(value: string) { return [...new Set((value.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) ?? []).filter((word) => !traceStopWords.has(word)))]; }
-function policyMatchConfidence(actionHits: number, responseHits: number, expectedHits: number) {
-  // This is a textual-alignment confidence, not an evaluation-quality score.
-  // A direct action match is the strongest signal; response and expected-action
-  // wording add supporting confidence without making a weak match look certain.
-  const actionSignal = actionHits ? 0.55 + Math.min(0.2, (actionHits - 1) * 0.1) : 0;
-  const responseSignal = Math.min(0.15, responseHits * 0.05);
-  const expectedSignal = Math.min(0.1, expectedHits * 0.05);
-  return Math.round(Math.min(0.95, actionSignal + responseSignal + expectedSignal) * 100) / 100;
-}
-
-function policyMatchesFor(actualAction: string, expectedAction: string, actualResponse: string, blocks: Doc[]): Doc[] {
-  const actionTerms = new Set([...(actionKeywords[actualAction] ?? []), ...traceTerms(actualAction.replaceAll("_", " "))].map((word) => word.toLowerCase()));
-  const responseTerms = new Set(traceTerms(actualResponse));
-  const expectedTerms = new Set([...(actionKeywords[expectedAction] ?? []), ...traceTerms(expectedAction.replaceAll("_", " "))].map((word) => word.toLowerCase()));
-  return blocks.map((block: Doc) => {
-    const text = block.text.toLowerCase();
-    const actionMatches = [...actionTerms].filter((term) => text.includes(term));
-    const responseMatches = [...responseTerms].filter((term) => text.includes(term));
-    const expectedMatches = [...expectedTerms].filter((term) => text.includes(term));
-    const actionHits = actionMatches.length;
-    const responseHits = responseMatches.length;
-    const expectedHits = expectedMatches.length;
-    const relevance = actionHits * 5 + responseHits * 2 + expectedHits;
-    const matchTerms = [...new Set([...actionMatches, ...responseMatches, ...expectedMatches])].slice(0, 8);
-    return { ...block, relevance, confidence: policyMatchConfidence(actionHits, responseHits, expectedHits), matchTerms };
-  }).filter((block: Doc) => block.relevance > 0).sort((left: Doc, right: Doc) => right.relevance - left.relevance || left.lineStart - right.lineStart).slice(0, 3);
-}
-
-function improvementFor(expectedAction: string, actualAction: string) {
-  const preserve = {
-    GIVE_FULL_INTRODUCTION: "Before starting normal intake, deliver the complete Computershare Shareholder Services opening unless the caller has already interrupted with usable routing information.",
-    ASK_SHAREHOLDER_STATUS: "If shareholder status is already explicit in any earlier caller turn, preserve it and advance to the next unresolved field.",
-    ASK_RELATIONSHIP: "If the caller already supplied a relationship, preserve F1 and continue to the next unresolved field without asking again.",
-    ASK_FOR_COMPANY: "Before asking for a company, check the full conversation state. If one was supplied, resolve or confirm it instead of asking again.",
-    ASK_INTENT: "Before asking for intent, check the full conversation state. If it was supplied, carry it forward to the summary instead of asking again.",
-  } as Record<string, string>;
-  return preserve[actualAction] ?? `Add an explicit instruction: "After reviewing the full conversation state, ${expectedAction.replaceAll("_", " ").toLowerCase()} before taking any later workflow step."`;
-}
-
-function traceFor(expectedAction: string, actualAction: string, actualResponse: string, policyBlocks: Doc[]) {
-  const promptLine = blockForAction(expectedAction, policyBlocks);
-  const problematicInstruction = blockForAction(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, policyBlocks);
-  const policyMatches = policyMatchesFor(actualAction === "ACKNOWLEDGE" ? expectedAction : actualAction, expectedAction, actualResponse, policyBlocks);
-  return {
-    expectedAction,
-    actualAction,
-    promptLine,
-    problematicInstruction,
-    policyMatches,
-    improvement: expectedAction === actualAction || actualAction === "ACKNOWLEDGE" ? null : improvementFor(expectedAction, actualAction),
-  };
-}
-
-function promptsForAnalysis(store: Store, payload: Doc, dataset: Doc) {
-  const all = store.prompts ?? [];
-  const select = (source: "global" | "node", id?: string | null) => id
-    ? all.filter((prompt) => prompt.id === id && prompt.source === source)
-    : all.filter((prompt) => prompt.source === source && prompt.active);
-  const globalId = payload.global_prompt_id ?? dataset.idealGeneration?.globalPromptId;
-  const nodeId = payload.node_prompt_id ?? dataset.idealGeneration?.nodePromptId;
-  return [...select("global", globalId), ...select("node", nodeId)];
+async function llmMetric(metric: Doc, turns: Turn[], policy: string) {
+  const transcript = turns.filter((turn) => turn.role !== "tool").map((turn) => `Turn ${turn.index + 1} · ${turn.role === "caller" ? "Caller" : "Agent"}: ${turn.content}`).join("\n");
+  const response = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ criteria: metric.criteria, model: metric.judge_model, policy, transcript }) });
+  const body = await response.json(); if (!response.ok) throw new Error(body.detail ?? "LLM judge failed."); return body as { score: number; reason: string; potential_fix: string };
 }
 
 async function analyze(store: Store, datasetId: string, payload: Doc) {
   const dataset = store.datasets.find((item) => item.id === datasetId); if (!dataset) throw new Error("Dataset not found."); const conversations = dataset.conversations.filter((item: Doc) => item.actualTurns?.length); if (!conversations.length) throw new Error("This dataset has no matching actual-agent turns.");
-  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id)); const prompts = promptsForAnalysis(store, payload, dataset); const policyBlocks = promptBlocks(prompts); const runs = await Promise.all(conversations.map(async (conversation: Doc) => { const ideal = idealTurns(conversation); let callerIndex = -1; const actions = conversation.actualTurns.filter((turn: Turn) => turn.role === "agent").map((turn: Turn) => { callerIndex += 1; const row = conversation.idealRows[callerIndex] ?? {}; const expectedAction = selectedAction(row); const actualAction = actionFor(turn.content); return { turn: turn.index + 1, callerInput: row.userTurn ?? "", agentResponse: turn.content, expectedAction, actualAction, decision: actualAction === expectedAction || actualAction === "ACKNOWLEDGE" ? "CORRECT" : "INCORRECT", promptTrace: traceFor(expectedAction, actualAction, turn.content, policyBlocks) }; }); const results = await Promise.all(metrics.map(async (metric) => { if (metric.implementation_key) { const [value, reason, break_turn] = score(metric.implementation_key, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: value, status: value >= metric.threshold ? "PASS" : "FAIL", reason, break_turn }; } try { const judged = await llmMetric(metric, conversation.actualTurns); return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: judged.score, status: judged.score >= metric.threshold ? "PASS" : "FAIL", reason: judged.reason }; } catch (error) { return { metric_id: metric.id, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run." }; } })); const scored = results.filter((result) => result.score != null); const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null; const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: weightedScore == null ? "NOT_RUN" : weightedScore >= .8 ? "PASS" : "FAIL", weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, idealTranscript: ideal, actionTrace: actions, breaks: actions.filter((item: Doc) => item.decision === "INCORRECT").map((item: Doc) => ({ turn: item.turn, expectedAction: item.expectedAction, actualAction: item.actualAction, severity: "HIGH", suggestedFix: `The selected ideal next action is ${String(item.expectedAction).replaceAll("_", " ").toLowerCase()}.` })), sources: { policy: prompts.map(promptSourceLabel), criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1); store.runs.unshift(report); return report; })); return { datasetId, runs };
+  const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id));
+  const policy = activePolicy(store);
+  const runs = await Promise.all(conversations.map(async (conversation: Doc) => {
+    const results = await Promise.all(metrics.map(async (metric) => {
+      const identity = { metric_id: metric.id, metric_definition_id: metric.definition_id ?? metric.id, metric_version: metric.version, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight };
+      if (metric.implementation_key) {
+        const [value, reason, breakTurn] = score(metric.implementation_key, conversation.actualTurns);
+        return { ...identity, score: value, status: scoreStatus(value), reason, break_turn: breakTurn };
+      }
+      try {
+        const judged = await llmMetric(metric, conversation.actualTurns, policy);
+        return { ...identity, score: judged.score, status: scoreStatus(judged.score), reason: judged.reason, potential_fix: judged.potential_fix, break_turn: null };
+      } catch (error) {
+        return { ...identity, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run.", break_turn: null };
+      }
+    }));
+    const scored = results.filter((result) => result.score != null);
+    const weightedScore = scored.length ? scored.reduce((total, result) => total + result.score * result.weight, 0) / scored.reduce((total, result) => total + result.weight, 0) : null;
+    const report = make("evaluation", { name: `${dataset.name} · ${conversation.conversationId}`, conversationId: conversation.conversationId, outcome: scoreStatus(weightedScore), weightedScore: weightedScore == null ? null : Number(weightedScore.toFixed(2)), metricResults: results, transcript: conversation.actualTurns, sources: { criteria: metrics.map((item) => `${item.name} v${item.version}`) } }, store.runs.length + 1);
+    store.runs.unshift(report);
+    return report;
+  }));
+  return { datasetId, runs };
 }
 
 export async function localRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const store = read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc; let shouldPersist = true;
-  if (url === "/api/prompts" && options.method === "POST") { if (!payload.name?.trim() || !payload.text?.trim() || !["global", "node"].includes(payload.source)) throw new Error("Prompt name, source, and text are required."); if (payload.source === "node" && !payload.node_name?.trim()) throw new Error("A node prompt needs a node name."); store.prompts ??= []; if (payload.set_active) store.prompts.forEach((item) => { if (item.source === payload.source) item.active = false; }); const version = Math.max(0, ...store.prompts.filter((item) => item.source === payload.source).map((item) => item.version ?? 0)) + 1; result = make("prompt", { ...payload, blocks: blocks(payload.source, payload.text) }, version, Boolean(payload.set_active)); store.prompts.unshift(result); }
+  if (url === "/api/prompt-mode" && options.method === "POST") { if (payload.mode !== "pathway" && payload.mode !== "assistant") throw new Error("Choose either Pathway or Assistant mode."); store.promptMode = payload.mode; result = { mode: store.promptMode }; }
+  else if (url === "/api/prompts" && options.method === "POST") { if (!payload.name?.trim() || !payload.text?.trim() || !["global", "node", "assistant"].includes(payload.source)) throw new Error("Prompt name, source, and text are required."); if (payload.source === "node" && !payload.node_name?.trim()) throw new Error("A node prompt needs a node name."); store.prompts ??= []; if (payload.set_active) store.prompts.forEach((item) => { if (item.source === payload.source && (item.source !== "node" || item.node_name === payload.node_name)) item.active = false; }); const version = Math.max(0, ...store.prompts.filter((item) => item.source === payload.source && (item.source !== "node" || item.node_name === payload.node_name)).map((item) => item.version ?? 0)) + 1; result = make("prompt", { ...payload, blocks: blocks(payload.source, payload.text) }, version, Boolean(payload.set_active)); store.prompts.unshift(result); }
   else if (url === "/api/metrics" && options.method === "POST") { result = make("metric", payload, store.metrics.length + 1); store.metrics.unshift(result); }
   else if (/^\/api\/metrics\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.metrics.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Metric not found."); const old = store.metrics[index]; result = make("metric", { ...payload, isDefault: old.isDefault ?? false, definition_id: old.definition_id ?? old.id }, old.version + 1); store.metrics[index] = result; }
-  else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", await buildDataset(store, payload), store.datasets.length + 1); store.datasets.unshift(result); }
-  else if (/^\/api\/datasets\/[^/]+\/generate-ideals$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = await applyPromptGeneratedIdeals(store.datasets[index], selectedPrompts(store), payload.preserve_manual_overrides !== false); store.datasets[index] = result; }
-  else if (/^\/api\/datasets\/[^/]+\/ideal-table\/preview$/.test(url) && options.method === "POST") { const parts = url.split("/"); const dataset = store.datasets.find((item) => item.id === parts[3]); if (!dataset) throw new Error("Dataset not found."); result = applyIdealTableCsv(dataset, payload.ideal_behavior_csv ?? ""); shouldPersist = false; }
-  else if (/^\/api\/datasets\/[^/]+\/ideal-table$/.test(url) && options.method === "POST") { const parts = url.split("/"); const index = store.datasets.findIndex((item) => item.id === parts[3]); if (index < 0) throw new Error("Dataset not found."); result = applyIdealTableCsv(store.datasets[index], payload.ideal_behavior_csv ?? ""); store.datasets[index] = result; }
+  else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", buildDatasetShell(payload), store.datasets.length + 1); store.datasets.unshift(result); }
   else if (/^\/api\/datasets\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.datasets.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Dataset not found."); result = { ...store.datasets[index], ...payload, updated_at: now() }; store.datasets[index] = result; }
   else { const match = url.match(/^\/api\/datasets\/([^/]+)\/analyze$/); if (!match || options.method !== "POST") throw new Error("This action is not available locally."); result = await analyze(store, match[1], payload); }
   if (shouldPersist) write(store); return result as T;
