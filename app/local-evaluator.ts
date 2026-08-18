@@ -5,7 +5,7 @@ type Store = { flowVersion?: number; metricCatalogVersion?: number; promptMode?:
 type Turn = { id: string; index: number; role: "caller" | "agent" | "tool" | "tool_result"; content: string };
 
 const key = "cpu-evaluator-local-v2";
-const flowVersion = 10;
+const flowVersion = 13;
 const metricCatalogVersion = 3;
 const defaultMetricSeeds: Array<[string, string]> = [
   [
@@ -211,9 +211,9 @@ function removeIdealState(dataset: Doc): Doc {
 }
 
 function removeIdealStateFromRun(run: Doc): Doc {
-  const { idealTranscript: _idealTranscript, actionTrace: _actionTrace, breaks: _breaks, ...remaining } = run;
+  const { idealTranscript: _idealTranscript, actionTrace: _actionTrace, breaks: _breaks, analysisPotentialFix: _analysisPotentialFix, ...remaining } = run;
   return { ...remaining, metricResults: (remaining.metricResults ?? []).map((metric: Doc) => {
-    const { promptTrace: _promptTrace, ...result } = metric;
+    const { promptTrace: _promptTrace, potential_fix: _potentialFix, ...result } = metric;
     return result;
   }) };
 }
@@ -288,16 +288,43 @@ function scoreStatus(value: number | null) {
   return "FAIL";
 }
 
-async function llmMetric(metric: Doc, turns: Turn[], policy: string) {
+async function llmMetric(metric: Doc, turns: Turn[]) {
   const transcript = turns.filter((turn) => turn.role !== "tool").map((turn) => `Turn ${turn.index + 1} · ${turn.role === "caller" ? "Caller" : "Agent"}: ${turn.content}`).join("\n");
-  const response = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ criteria: metric.criteria, model: metric.judge_model, policy, transcript }) });
-  const body = await response.json(); if (!response.ok) throw new Error(body.detail ?? "LLM judge failed."); return body as { score: number; reason: string; potential_fix: string };
+  const response = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ criteria: metric.criteria, model: metric.judge_model, transcript }) });
+  const body = await response.json(); if (!response.ok) throw new Error(body.detail ?? "LLM judge failed."); return body as { score: number; reason: string };
+}
+
+type RunFailure = { metric: string; reason: string };
+type RunPotentialFix = { exactFix: string };
+
+function fallbackRunPotentialFix(failures: RunFailure[]) {
+  const metrics = [...new Set(failures.map((failure) => failure.metric))].slice(0, 3).join(", ");
+  const reasons = [...new Set(failures.map((failure) => failure.reason))].slice(0, 2).join("; ");
+  return {
+    exactFix: [
+      `Focus the active prompt on the recurring gaps in ${metrics}.`,
+      `The main observed issues were: ${reasons}.`,
+      "State the required agent behavior and ordering in direct, testable language.",
+      "Reconcile or remove instructions that could leave the behavior ambiguous or conflicting.",
+      "Rerun the complete dataset after updating the prompt to confirm the improvement.",
+    ].join("\n"),
+  } satisfies RunPotentialFix;
+}
+
+async function runPotentialFix(policy: string, failures: RunFailure[]) {
+  const fallback = fallbackRunPotentialFix(failures);
+  try {
+    const response = await fetch("/api/judge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ task: "run_summary", model: "gpt-4.1-mini", policy, failures: failures.slice(0, 12) }) });
+    const body = await response.json();
+    if (!response.ok || typeof body.exact_fix !== "string") return fallback;
+    const lines = body.exact_fix.split(/\r?\n/).map((line: string) => line.trim()).filter(Boolean);
+    return lines.length === 5 ? { exactFix: lines.join("\n") } : fallback;
+  } catch { return fallback; }
 }
 
 async function analyze(store: Store, datasetId: string, payload: Doc) {
   const dataset = store.datasets.find((item) => item.id === datasetId); if (!dataset) throw new Error("Dataset not found."); const conversations = dataset.conversations.filter((item: Doc) => item.actualTurns?.length); if (!conversations.length) throw new Error("This dataset has no matching actual-agent turns.");
   const metrics = store.metrics.filter((metric) => (payload.metric_ids ?? []).includes(metric.id));
-  const policy = activePolicy(store);
   const runs = await Promise.all(conversations.map(async (conversation: Doc) => {
     const results = await Promise.all(metrics.map(async (metric) => {
       const identity = { metric_id: metric.id, metric_definition_id: metric.definition_id ?? metric.id, metric_version: metric.version, name: metric.name, type: metric.type, evaluation_scope: "conversation", threshold: metric.threshold, weight: metric.weight };
@@ -306,8 +333,8 @@ async function analyze(store: Store, datasetId: string, payload: Doc) {
         return { ...identity, score: value, status: scoreStatus(value), reason, break_turn: breakTurn };
       }
       try {
-        const judged = await llmMetric(metric, conversation.actualTurns, policy);
-        return { ...identity, score: judged.score, status: scoreStatus(judged.score), reason: judged.reason, potential_fix: judged.potential_fix, break_turn: null };
+        const judged = await llmMetric(metric, conversation.actualTurns);
+        return { ...identity, score: judged.score, status: scoreStatus(judged.score), reason: judged.reason, break_turn: null };
       } catch (error) {
         return { ...identity, score: null, status: "NOT_RUN", reason: error instanceof Error ? error.message : "LLM judge did not run.", break_turn: null };
       }
@@ -318,6 +345,11 @@ async function analyze(store: Store, datasetId: string, payload: Doc) {
     store.runs.unshift(report);
     return report;
   }));
+  const failures = runs.flatMap((run) => (run.metricResults ?? []).filter((metric: Doc) => typeof metric.score === "number" && metric.score < .5).map((metric: Doc) => ({ metric: metric.name ?? "this metric", reason: metric.reason?.trim() ?? "the expected behavior was not met" })));
+  if (failures.length) {
+    const analysisPotentialFix = await runPotentialFix(activePolicy(store), failures);
+    runs.forEach((run) => { run.analysisPotentialFix = analysisPotentialFix; });
+  }
   return { datasetId, runs };
 }
 
