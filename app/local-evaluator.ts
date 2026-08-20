@@ -5,8 +5,11 @@ type Store = { flowVersion?: number; metricCatalogVersion?: number; promptMode?:
 type Turn = { id: string; index: number; role: "caller" | "agent" | "tool" | "tool_result"; content: string };
 
 const key = "cpu-evaluator-local-v2";
-const flowVersion = 13;
+const databaseName = "cpu-evaluator";
+const databaseStore = "workspaces";
+const flowVersion = 14;
 const metricCatalogVersion = 3;
+let databasePromise: Promise<IDBDatabase> | null = null;
 const defaultMetricSeeds: Array<[string, string]> = [
   [
     "Full Introduction Adherence",
@@ -194,18 +197,100 @@ function ensureMetricCatalog(store: Store) {
   store.metricCatalogVersion = metricCatalogVersion;
 }
 
-function read(): Store {
-  if (typeof window === "undefined") return fresh();
-  try { const value = window.localStorage.getItem(key); if (value) { const saved = JSON.parse(value) as Store; let changed = false; if (!saved.prompts) { saved.prompts = []; changed = true; } if (saved.promptMode !== "pathway" && saved.promptMode !== "assistant") { saved.promptMode = "pathway"; changed = true; } if (saved.flowVersion !== flowVersion) { saved.datasets = saved.datasets.map(removeIdealState); saved.runs = saved.runs.map(removeIdealStateFromRun); saved.flowVersion = flowVersion; changed = true; } if (saved.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(saved); changed = true; } if (changed) write(saved); return saved; } } catch { /* reset malformed local state */ }
-  const initial = fresh(); write(initial); return initial;
+function openDatabase() {
+  if (databasePromise) return databasePromise;
+  databasePromise = new Promise((resolve, reject) => {
+    if (typeof window === "undefined" || !window.indexedDB) { reject(new Error("IndexedDB is unavailable in this browser.")); return; }
+    const request = window.indexedDB.open(databaseName, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(databaseStore)) request.result.createObjectStore(databaseStore, { keyPath: "id" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("Could not open browser storage."));
+    request.onblocked = () => reject(new Error("Close any other open CPU Evaluator tabs, then retry."));
+  });
+  return databasePromise;
 }
-function write(store: Store) { if (typeof window !== "undefined") window.localStorage.setItem(key, JSON.stringify(store)); }
-export function bootstrap(): Doc { const store = read(); return { ...store, secrets: [], judgeConfigured: true, dashboard: { latestScore: store.runs[0]?.weightedScore ?? null } }; }
+
+function requestResult<T>(request: IDBRequest<T>) {
+  return new Promise<T>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("Browser storage request failed."));
+  });
+}
+
+function transactionComplete(transaction: IDBTransaction) {
+  return new Promise<void>((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("Browser storage transaction failed."));
+    transaction.onabort = () => reject(transaction.error ?? new Error("Browser storage transaction was aborted."));
+  });
+}
+
+async function readIndexedStore() {
+  const database = await openDatabase();
+  const transaction = database.transaction(databaseStore, "readonly");
+  const record = await requestResult<{ id: string; store: Store } | undefined>(transaction.objectStore(databaseStore).get(key));
+  return record?.store ?? null;
+}
+
+async function requestDurableStorage() {
+  try { await navigator.storage?.persist?.(); } catch { /* Browser storage remains usable without persistence. */ }
+}
+
+async function write(store: Store) {
+  if (typeof window === "undefined") return;
+  const database = await openDatabase();
+  const transaction = database.transaction(databaseStore, "readwrite");
+  transaction.objectStore(databaseStore).put({ id: key, store });
+  await transactionComplete(transaction);
+  void requestDurableStorage();
+}
+
+function normalizeStore(saved: Store) {
+  const store = saved as Store;
+  let changed = false;
+  if (!Array.isArray(store.prompts)) { store.prompts = []; changed = true; }
+  if (!Array.isArray(store.datasets)) { store.datasets = []; changed = true; }
+  if (!Array.isArray(store.metrics)) { store.metrics = []; changed = true; }
+  if (!Array.isArray(store.runs)) { store.runs = []; changed = true; }
+  if (store.promptMode !== "pathway" && store.promptMode !== "assistant") { store.promptMode = "pathway"; changed = true; }
+  if (store.flowVersion !== flowVersion) { store.datasets = store.datasets.map(removeIdealState); store.runs = store.runs.map(removeIdealStateFromRun); store.flowVersion = flowVersion; changed = true; }
+  if (store.metricCatalogVersion !== metricCatalogVersion) { ensureMetricCatalog(store); changed = true; }
+  return { store, changed };
+}
+
+async function read(): Promise<Store> {
+  if (typeof window === "undefined") return fresh();
+  const saved = await readIndexedStore();
+  if (saved) {
+    const normalized = normalizeStore(saved);
+    if (normalized.changed) await write(normalized.store);
+    return normalized.store;
+  }
+  try {
+    const legacyValue = window.localStorage.getItem(key);
+    if (legacyValue) {
+      const normalized = normalizeStore(JSON.parse(legacyValue) as Store);
+      await write(normalized.store);
+      window.localStorage.removeItem(key);
+      return normalized.store;
+    }
+  } catch { /* Ignore malformed legacy localStorage and start a new IndexedDB workspace. */ }
+  const initial = fresh();
+  await write(initial);
+  return initial;
+}
+
+export async function bootstrap(): Promise<Doc> {
+  const store = await read();
+  return { ...store, secrets: [], judgeConfigured: true, dashboard: { latestScore: store.runs[0]?.weightedScore ?? null } };
+}
 
 function removeIdealState(dataset: Doc): Doc {
   const { idealGeneration: _idealGeneration, ...rest } = dataset;
   return { ...rest, conversations: (dataset.conversations ?? []).map((conversation: Doc) => {
-    const { idealRows: _idealRows, ...remaining } = conversation;
+    const { idealRows: _idealRows, userRows: _userRows, actualRows: _actualRows, ...remaining } = conversation;
     return remaining;
   }) };
 }
@@ -254,7 +339,7 @@ function buildDatasetShell(payload: Doc) {
     const matching = new Map(actualRows.map((row) => [row.turn, row]));
     const actualTurns: Turn[] = [];
     userRows.forEach((row) => { const actual = matching.get(row.turn); actualTurns.push({ id: uid(), index: actualTurns.length, role: "caller", content: actual?.userContent || row.content }); if (actual) actualTurns.push({ id: uid(), index: actualTurns.length, role: "agent", content: actual.content }); });
-    return { conversationId, userRows, actualRows, actualTurns, actualAttached: Boolean(actualRows.length) };
+    return { conversationId, actualTurns, actualAttached: Boolean(actualRows.length) };
   });
   return { name: payload.name, source: "Actual Agent Turn Data CSV", conversations, conversationCount: conversations.length, actualConversationCount: conversations.filter((item) => item.actualAttached).length };
 }
@@ -354,7 +439,7 @@ async function analyze(store: Store, datasetId: string, payload: Doc) {
 }
 
 export async function localRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const store = read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc; let shouldPersist = true;
+  const store = await read(); const payload = typeof options.body === "string" ? JSON.parse(options.body) as Doc : {}; let result: Doc; let shouldPersist = true;
   if (url === "/api/prompt-mode" && options.method === "POST") { if (payload.mode !== "pathway" && payload.mode !== "assistant") throw new Error("Choose either Pathway or Assistant mode."); store.promptMode = payload.mode; result = { mode: store.promptMode }; }
   else if (url === "/api/prompts" && options.method === "POST") { if (!payload.name?.trim() || !payload.text?.trim() || !["global", "node", "assistant"].includes(payload.source)) throw new Error("Prompt name, source, and text are required."); if (payload.source === "node" && !payload.node_name?.trim()) throw new Error("A node prompt needs a node name."); store.prompts ??= []; if (payload.set_active) store.prompts.forEach((item) => { if (item.source === payload.source && (item.source !== "node" || item.node_name === payload.node_name)) item.active = false; }); const version = Math.max(0, ...store.prompts.filter((item) => item.source === payload.source && (item.source !== "node" || item.node_name === payload.node_name)).map((item) => item.version ?? 0)) + 1; result = make("prompt", { ...payload, blocks: blocks(payload.source, payload.text) }, version, Boolean(payload.set_active)); store.prompts.unshift(result); }
   else if (url === "/api/metrics" && options.method === "POST") { result = make("metric", payload, store.metrics.length + 1); store.metrics.unshift(result); }
@@ -362,5 +447,5 @@ export async function localRequest<T>(url: string, options: RequestInit = {}): P
   else if (url === "/api/datasets" && options.method === "POST") { result = make("dataset", buildDatasetShell(payload), store.datasets.length + 1); store.datasets.unshift(result); }
   else if (/^\/api\/datasets\/[^/]+$/.test(url) && options.method === "PUT") { const index = store.datasets.findIndex((item) => item.id === url.split("/").pop()); if (index < 0) throw new Error("Dataset not found."); result = { ...store.datasets[index], ...payload, updated_at: now() }; store.datasets[index] = result; }
   else { const match = url.match(/^\/api\/datasets\/([^/]+)\/analyze$/); if (!match || options.method !== "POST") throw new Error("This action is not available locally."); result = await analyze(store, match[1], payload); }
-  if (shouldPersist) write(store); return result as T;
+  if (shouldPersist) await write(store); return result as T;
 }

@@ -49,7 +49,7 @@ export default function Home() {
 
   const refresh = async () => {
     try {
-      setData(bootstrap());
+      setData(await bootstrap());
       setError(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not load the local evaluator.");
@@ -311,5 +311,5 @@ function Settings() {
   const [judgeStatus, setJudgeStatus] = useState<{ configured: boolean; keySuffix: string | null; model: string } | null>(null);
   const checkJudge = () => { void fetch("/api/judge", { cache: "no-store" }).then(async (response) => response.ok ? response.json() : null).then(setJudgeStatus).catch(() => setJudgeStatus(null)); };
   useEffect(checkJudge, []);
-  return <><Header eyebrow="LOCAL SETUP" title="Settings" subtitle="The local Next server reads the LLM key from .env.local; it is never sent to the browser." /><div className="split"><div className="card panel"><h3>Local workspace</h3><div className="notice safe" style={{ marginTop: 12 }}>Prompts, metric criteria, datasets, and results are stored in this browser&apos;s local storage.</div><p className="section-desc" style={{ marginTop: 12 }}>The server-only OpenAI path evaluates selected metrics and records a concise score rationale.</p><div className={`notice ${judgeStatus?.configured ? "safe" : "info"}`} style={{ marginTop: 12 }}>{judgeStatus ? judgeStatus.configured ? `Local judge loaded · key ending ${judgeStatus.keySuffix} · ${judgeStatus.model}` : "No API key is loaded by this local server." : "Checking the local judge key…"}</div><button className="button tiny" style={{ marginTop: 8 }} onClick={checkJudge}>Refresh key status</button></div><div className="card panel"><h3>Score guide</h3><div className="notice info" style={{ marginTop: 12 }}>Scores above 80% pass, scores from 50% to 80% partially pass, and scores below 50% fail.</div></div></div></>;
+  return <><Header eyebrow="LOCAL SETUP" title="Settings" subtitle="The local Next server reads the LLM key from .env.local; it is never sent to the browser." /><div className="split"><div className="card panel"><h3>Local workspace</h3><div className="notice safe" style={{ marginTop: 12 }}>Prompts, metric criteria, datasets, and results are stored in this browser&apos;s IndexedDB workspace.</div><p className="section-desc" style={{ marginTop: 12 }}>IndexedDB provides substantially more room than local storage for larger datasets. The server-only OpenAI path evaluates selected metrics and records a concise score rationale.</p><div className={`notice ${judgeStatus?.configured ? "safe" : "info"}`} style={{ marginTop: 12 }}>{judgeStatus ? judgeStatus.configured ? `Local judge loaded · key ending ${judgeStatus.keySuffix} · ${judgeStatus.model}` : "No API key is loaded by this local server." : "Checking the local judge key…"}</div><button className="button tiny" style={{ marginTop: 8 }} onClick={checkJudge}>Refresh key status</button></div><div className="card panel"><h3>Score guide</h3><div className="notice info" style={{ marginTop: 12 }}>Scores above 80% pass, scores from 50% to 80% partially pass, and scores below 50% fail.</div></div></div></>;
 }
